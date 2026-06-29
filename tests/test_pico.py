@@ -23,6 +23,33 @@ def build_workspace(tmp_path):
     return WorkspaceContext.build(tmp_path)
 
 
+def test_workspace_context_decodes_git_status_as_utf8(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        if kwargs.get("encoding") != "utf-8":
+            raise UnicodeDecodeError("gbk", b"\xae", 0, 1, "illegal multibyte sequence")
+        outputs = {
+            ("rev-parse", "--show-toplevel"): str(tmp_path),
+            ("branch", "--show-current"): "main",
+            ("symbolic-ref", "--short", "refs/remotes/origin/HEAD"): "origin/main",
+            ("status", "--short"): " M docs/SkillForge_Fusion_增订说明.md",
+            ("log", "--oneline", "-5"): "abc1234 初始提交",
+        }
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=outputs.get(tuple(command[1:]), "") + "\n",
+            stderr="",
+        )
+
+    with patch("skillforge.workspace.subprocess.run", fake_run):
+        workspace = WorkspaceContext.build(tmp_path)
+
+    assert "增订说明.md" in workspace.status
+    assert workspace.recent_commits == ["abc1234 初始提交"]
+
+
 def build_agent(tmp_path, outputs, **kwargs):
     workspace = build_workspace(tmp_path)
     store = SessionStore(tmp_path / ".skillforge" / "sessions")
