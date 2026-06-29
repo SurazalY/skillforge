@@ -41,14 +41,15 @@ DEFAULT_SECRET_ENV_NAMES = (
 )
 
 WELCOME_ART = (
-    "        /\\___/\\\\",
-    "       (  o o  )",
-    "       /   ^   \\\\",
-    "      /|       |\\\\",
+    "____  _  ___ _     _     _____ ___  ____  ____ _____   ",
+    "/ ___|| |/ (_) |   | |   |  ___/ _ \\|  _ \\/ ___| ____| ",
+    "\\___ \\| ' /| | |   | |   | |_ | | | | |_) | |  _|  _|  ",
+    " ___) | . \\| | |___| |___|  _|| |_| |  _ <| |_| | |___ ",
+    "|____/|_|\\_\\_|_____|_____|_|   \\___/|_| \\_\\\\____|_____|",
 )
-WELCOME_NAME = "skillforge"
-WELCOME_SUBTITLE = "local coding agent"
-WELCOME_STATUS = "calm shell, ready for work"
+WELCOME_NAME = "local coding agent"
+WELCOME_SUBTITLE = "calm shell, ready for work"
+WELCOME_STATUS = "ready to forge your skills"
 HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
@@ -203,7 +204,29 @@ def build_welcome(agent, model, host):
         return f"| {left}{' ' * gap}{right} |"
 
     line = divider("=")
-    rows = [center(text) for text in WELCOME_ART]
+    
+    # 启用 Windows 控制台对 ANSI 的支持
+    import os
+    os.system('')
+    
+    # 渐变火焰色 (红、橙、黄、黄、黄)
+    colors = [
+        "\033[91m",        # 亮红
+        "\033[38;5;208m",  # 橙
+        "\033[93m",        # 亮黄
+        "\033[93m",        # 亮黄
+        "\033[93m",        # 亮黄
+    ]
+    
+    rows = []
+    for idx, text in enumerate(WELCOME_ART):
+        centered = center(text)
+        content = text.strip()
+        if content and idx < len(colors):
+            colored_content = f"{colors[idx]}{content}\033[0m"
+            centered = centered.replace(content, colored_content, 1)
+        rows.append(centered)
+
     rows.extend(
         [
             center(WELCOME_NAME),
