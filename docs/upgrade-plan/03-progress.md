@@ -15,7 +15,7 @@
 | 阶段 | 依赖 | 范围入口 | 状态 | 启动决定 | 主控归属 | 已收到报告 | 关闭决定 | Git 检查点 |
 |---|---|---|---|---|---|---|---|---|
 | A 基线固定 | 无 | [A](phases/A-baseline.md) | CLOSED | 原启动及收尾补充均获用户批准 | 另一套 harness 的既有 A 主控 | [A 报告，含第 8 节收尾](reports/A-stage-report.md) | 2026-09-13 用户明确确认 | `f351988c1dda3bb62012580d4b3fa08fde9b8b8a`，仅本地，已建立 |
-| B 执行与上下文 | A 已由用户关闭，已满足 | [B](phases/B-runtime-context.md)；[启动 Prompt](prompts/B-start.md) | CLOSED | 2026-09-13 用户明确批准，已执行 | 另一套 harness 的 B 主控 | [B 阶段报告，含 §1.1 闭环补充](reports/B-stage-report.md) | 2026-09-13 用户明确“可以关闭” | 关闭时建立；见本节登记 |
+| B 执行与上下文 | A 已由用户关闭，已满足 | [B](phases/B-runtime-context.md)；[启动 Prompt](prompts/B-start.md) | CLOSED | 2026-09-13 用户明确批准，已执行 | 另一套 harness 的 B 主控 | [B 阶段报告，含 §1.1 闭环补充](reports/B-stage-report.md) | 2026-09-13 用户明确“可以关闭” | `352f756407d271ae5bd43ab6eb35c5a82d7a7530`，分支 `upgrade-b` |
 | C 可靠本地运行 | B 已由用户关闭 | [C](phases/C-reliable-local.md) | PREPARED | 未批准 | 待用户指定 | 无 | 未关闭 | 关闭后提醒 |
 | D 经验与协作 | C 已由用户关闭 | [D](phases/D-skills-delegation.md) | PREPARED | 未批准 | 待用户指定 | 无 | 未关闭 | 关闭后提醒 |
 | E 评测与终端体验 | D 已由用户关闭 | [E](phases/E-evaluation-cli.md) | PREPARED | 未批准 | 待用户指定 | 无 | 未关闭 | 关闭后提醒 |
