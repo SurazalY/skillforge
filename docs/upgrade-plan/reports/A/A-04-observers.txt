@@ -1,0 +1,30 @@
+# A-04 thin observers (offline, isolated cwd)
+# date: 2026-09-13
+# interpreter: D:\IDE\python\python.exe (Python 3.12.10)
+# did not modify skillforge/ or product tests
+
+## patch unique match (EX04 current behavior)
+script: .tmp_a04_patch_obs.py
+cwd workspace: .tmp_a04_patch
+canonical copy: baseline-inputs/scripts/observe_patch_unique_match.py
+
+zero: error "old_text must occur exactly once, found 0"; file unchanged
+one:  "patched sample.txt"; file becomes "hello agent\n"
+two:  error "old_text must occur exactly once, found 2"; file unchanged
+
+## over-budget current request retention (CT02/CT05 related baseline)
+script: .tmp_a04_budget_obs.py
+cwd workspace: .tmp_a04_budget
+canonical copy: baseline-inputs/scripts/observe_prompt_budget.py
+total_budget: 12000 characters
+request: "KEEP-CURRENT-REQUEST " + 13000 X
+answer: A04-budget-kept-request
+prompt_over_budget: true
+prompt_chars: 15293
+current_request_raw_chars: 13021
+current_request_kept: true
+
+notes:
+  - this is current character-budget behavior, not Token-window INPUT_TOO_LARGE
+  - do not treat as CT02 PASS for the upgrade target
+  - V01 compression percentages were NOT reproduced

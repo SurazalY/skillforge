@@ -1,0 +1,32 @@
+# A-04 offline pytest (WSL, only the Windows-failed nodeids)
+# date: 2026-09-13
+# cwd: /mnt/d/Project/SkillForge_0912
+# interpreter: /usr/bin/python3 (Python 3.12.3)
+# pytest: 9.0.2
+# helper: .tmp_a04_wsl_pytest.sh (isolation helper, not product code)
+# online: no
+# secrets: none
+# WSL note: localhost NAT warning still appears; path and pytest ran
+
+command:
+  wsl -e bash /mnt/d/Project/SkillForge_0912/.tmp_a04_wsl_pytest.sh
+  # equivalent:
+  # cd /mnt/d/Project/SkillForge_0912
+  # python3 -m pytest -v --tb=short --no-header \
+  #   tests/test_safety_invariants.py::test_symlink_path_traversal_is_rejected \
+  #   tests/test_fusion_workflow.py::test_log_run_falls_back_for_non_pytest_commands_and_never_marks_pass
+
+results:
+  collected: 2
+  passed: 2
+  failed: 0
+  duration_s: 0.38
+
+PASSED:
+  test_symlink_path_traversal_is_rejected
+  test_log_run_falls_back_for_non_pytest_commands_and_never_marks_pass
+
+notes:
+  - /bin/echo exists on this WSL
+  - symlink creation succeeded on this WSL
+  - do not claim Windows symlink/EX05 symlink path is PASS; that fixture is blocked by privilege

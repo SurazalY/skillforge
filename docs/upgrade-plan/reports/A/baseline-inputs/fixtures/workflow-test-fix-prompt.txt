@@ -1,0 +1,3 @@
+Patch notes.txt from before to after if needed, then run a non-pytest command via log_run during verify, and try to hand off.
+
+This is a recipe prompt for `python -m skillforge --workflow test_fix`. A-04 did not run this CLI path (NOT_RUN). Offline invariant is covered by existing pytest, not by claiming this prompt already passed.

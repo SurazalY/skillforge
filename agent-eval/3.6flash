@@ -1,0 +1,440 @@
+# SkillForge 分析答卷
+
+## 执行摘要
+
+本分析针对 `SkillForge` (v0.1.0) 仓库代码、测试基线、`code_change` 工作流架构、上下文预算控制、工具安全护栏及两个关键 Bug 进行了全面的只读审查。
+1. **测试基线**：当前权威包为 `skillforge/`，权威测试为 `tests/`；根目录下嵌套的旧仓库 `pico_coding-agent-main/` 会混入未找到 `pico` 模块的 8 项收集错误。单测中有 1 项欢迎框测试因 ANSI 控制字符增加 Python `str` 长度而断言失败。
+2. **工作流架构与上下文**：`code_change` 包含 7 个相衔接的 Phase，通过 TaskPacket 控制阶段工具收缩与双重预算；CompletionGate 不仅检查 4 类证据存在性，还强校验 `verification` 和 `audit` 的状态；ContextManager 采用 4 阶段优先压缩策略，但由于最新用户请求不参与裁剪，总 Prompt 无法绝对保证不超过 `total_budget`。
+3. **关键 Bug 根因**：
+   - SSE Usage 丢失 Bug：`skillforge/models.py:197` 在遇到 `response.output_text.done` 时提前 return，导致后续包含 `usage` 数据的 `response.completed` 事件未被读取，返回空 `response_data`。
+   - 中文记忆召回失败 Bug：`skillforge/memory.py:283` 的 `_tokenize` 使用仅匹配 ASCII 的正则 `[A-Za-z0-9_]+`，将中文提取为空 Token 集合，导致 Tag 与关键词重叠度计算均归零而全数过滤。
+
+---
+
+## Q1｜仓库权威路径与测试基线
+
+### 结论
+
+1. **权威目录与干扰项**：
+   - **权威包路径**：`skillforge/`（参见 [pyproject.toml:6](file:///D:/Project/skill-forge/pyproject.toml#L6) `name = "skillforge"` 与 [pyproject.toml:22](file:///D:/Project/skill-forge/pyproject.toml#L22) `packages = ["skillforge"]`）。
+   - **权威测试路径**：`tests/`（包含 14 个主测试文件）。
+   - **干扰目录**：`pico_coding-agent-main/`。该目录为历史/嵌套旧仓库（包含 `pico_coding-agent-main/coding-agent-main/tests/`），因其测试依赖已更名的旧包 `pico`，而当前环境未安装 `pico` 模块，因此在默认递归收集时会产生 8 项 `ModuleNotFoundError: No module named 'pico'` 收集错误。
+2. **测试运行结果与失败项**：
+   - 执行命令：`python -m pytest tests -q`
+   - 通过/失败统计：206 通过，1 失败（共 207 个测试）。
+   - **唯一失败项**：`tests/test_pico.py::test_welcome_screen_keeps_box_shape_for_long_paths` (参见 [tests/test_pico.py:307-326](file:///D:/Project/skill-forge/tests/test_pico.py#L307-L326))。
+   - **失败的直接机制与属性识别**：
+     - 直接机制：在 [skillforge/cli.py:226-227](file:///D:/Project/skill-forge/skillforge/cli.py#L226-L227) 中，`build_welcome()` 为 ASCII 艺术字 WELCOME_ART 嵌入了 ANSI 渐变颜色的转义字符序列（如 `\033[91m`、`\033[38;5;208m`、`\033[0m`）。
+     - 测试在 [tests/test_pico.py:316](file:///D:/Project/skill-forge/tests/test_pico.py#L316) 断言 `assert len({len(line) for line in lines}) == 1`。
+     - ANSI 转义序列在终端渲染时是不可见的（可见宽度/Display width 保持 80），但在 Python 中占用了真实的 `str` 字符长度（Python 字符串长度 / String length），使得带颜色艺术字行的 `len(line)` 变为 89 或 95 字符，而普通行长度为 80 字符。因此断言触发 `AssertionError: assert 3 == 1 (where 3 = len({80, 89, 95}))`。
+     - 结论：这是 **Python 字符串长度 (len(string))** 问题，而不是终端“可见宽度”问题。
+3. **裸 `pytest -q` 混入临时目录现象的原因**：
+   - 裸运行 `pytest` 时未指定目标目录，且 [pyproject.toml:1-23](file:///D:/Project/skill-forge/pyproject.toml#L1-L23) 中未配置 `[tool.pytest.ini_options]` 的 `testpaths = ["tests"]` 或 `norecursedirs`。
+   - pytest 默认从工作区根目录开始递归遍历所有子目录。如果开发人员或构建环境在本机产生了临时构建目录（如 `build/`、`dist/`）、虚拟环境（如 `.venv/`）、pytest 临时缓存（如 `/tmp/pytest-*`）或嵌套了其他代码仓库，pytest 会将其中符合 `test_*.py` 命名的文件一并收集，导致非仓库主线代码的测试被误触发或因缺少依赖而报错。
+
+### 证据与命令
+
+- **命令 1 (裸收集验证)**：
+  - 命令行：`python -m pytest --collect-only -q`
+  - 退出码：`1`
+  - 关键输出：`207 tests collected, 8 errors in 0.45s`；错误全部集中在 `pico_coding-agent-main/coding-agent-main/tests/` 下的 `ModuleNotFoundError: No module named 'pico'`。
+- **命令 2 (权威测试集验证)**：
+  - 命令行：`python -m pytest tests -q`
+  - 退出码：`1`
+  - 关键输出：`206 passed, 1 failed in 0.98s`；FAILED 项为 `tests/test_pico.py::test_welcome_screen_keeps_box_shape_for_long_paths`。
+- **代码证据**：
+  - 权威包配置：[pyproject.toml:6](file:///D:/Project/skill-forge/pyproject.toml#L6) (`name = "skillforge"`), [pyproject.toml:22](file:///D:/Project/skill-forge/pyproject.toml#L22) (`packages = ["skillforge"]`)。
+  - ANSI 颜色字符注入：[skillforge/cli.py:226-227](file:///D:/Project/skill-forge/skillforge/cli.py#L226-L227) (`colored_content = f"{colors[idx]}{content}\033[0m"`, `centered = centered.replace(...)`)。
+  - 欢迎框单测断言：[tests/test_pico.py:316](file:///D:/Project/skill-forge/tests/test_pico.py#L316) (`assert len({len(line) for line in lines}) == 1`)。
+
+### 最小修复方向
+
+*(注意：仅提出修复方案，不实际修改代码)*
+
+1. **解决默认测试发现范围的方案**（针对 `pyproject.toml`）：
+   - 在 [pyproject.toml](file:///D:/Project/skill-forge/pyproject.toml) 中增加 `[tool.pytest.ini_options]` 配置项：
+     ```toml
+     [tool.pytest.ini_options]
+     testpaths = ["tests"]
+     norecursedirs = ["pico_coding-agent-main", "*.egg-info", ".git", ".skillforge"]
+     ```
+   - **效果**：限制默认 `pytest` 命令仅检索 `tests/` 目录，且忽略 `pico_coding-agent-main` 嵌套目录及临时路径。
+2. **解决欢迎框失败的方案**（针对 `skillforge/cli.py` 或 `tests/test_pico.py`）：
+   - **方案 A (产品代码切分 ANSI)**：在 [skillforge/cli.py:180-243](file:///D:/Project/skill-forge/skillforge/cli.py#L180-L243) 的 `build_welcome` 函数中，对格式对齐计算（`center()`）与 ANSI 颜色渲染进行解耦，或者提供去除 ANSI 控制字符的纯文本测试辅助/无颜色渲染选项。
+   - **方案 B (测试断言剥离 ANSI)**：在 [tests/test_pico.py:313-316](file:///D:/Project/skill-forge/tests/test_pico.py#L313-L316) 中，使用正则表达式 `re.sub(r"\033\[[0-9;]*m", "", line)` 先清洗掉整行中的 ANSI 转义序列，再计算并断言 `len({len(clean_line) for clean_line in clean_lines}) == 1`。
+
+---
+
+## Q2｜`code_change` 工作流端到端架构
+
+### 组件与状态流
+
+1. **CLI 装配到 Runtime 的对象关系**：
+   - 入口在 [skillforge/cli.py:246-294](file:///D:/Project/skill-forge/skillforge/cli.py#L246-L294) 的 `build_agent(args)`。
+   - `build_agent` 依次解析 CLI 参数：
+     1) 构建工作区上下文 `WorkspaceContext.build(args.cwd)` ([skillforge/cli.py:264](file:///D:/Project/skill-forge/skillforge/cli.py#L264))；
+     2) 初始化会话存储 `SessionStore` ([skillforge/cli.py:267](file:///D:/Project/skill-forge/skillforge/cli.py#L267))；
+     3) 构造模型客户端 `_build_model_client(args)` ([skillforge/cli.py:268](file:///D:/Project/skill-forge/skillforge/cli.py#L268))；
+     4) 提取 `--workflow code_change` 参数并传给 `SkillForge` 构造函数 ([skillforge/cli.py:285-294](file:///D:/Project/skill-forge/skillforge/cli.py#L285-L294))。
+   - `SkillForge` 初始化 ([skillforge/runtime.py:120-210](file:///D:/Project/skill-forge/skillforge/runtime.py#L120-L210))：接收 `workflow="code_change"`，调用 `workflow_template("code_change")` 获取 `WorkflowIR` 对象，并初始化 `WorkflowKernel(workflow)` 保存状态。
+2. **7 个 Phase 顺序与工具收缩方式**：
+   - 7 个 Phase 定义于 [skillforge/workflow.py:173](file:///D:/Project/skill-forge/skillforge/workflow.py#L173)：`("intake", "plan_compile", "implement", "verify", "audit", "skill_distill", "handoff")`。
+   - Phase 工具白名单收缩定义于 [skillforge/workflow.py:838-857](file:///D:/Project/skill-forge/skillforge/workflow.py#L838-L857)：
+     - `intake`: (`list_files`, `read_file`, `search`) —— 仅探查。
+     - `plan_compile`: (`list_files`, `read_file`, `search`, `delegate`) —— 探查与派生只读子 Agent 编译方案。
+     - `implement`: (`list_files`, `read_file`, `search`, `run_shell`, `write_file`, `patch_file`, `delegate`, `log_run`, `log_brief`, `log_failure_detail`) —— 全量读写、修改与 Shell 运行。
+     - `verify`: (`list_files`, `read_file`, `search`, `run_shell`, `log_run`, `log_brief`, `log_failure_detail`) —— 禁用 `write_file`, `patch_file`, `delegate`，专门用于运行与记录测试。
+     - `audit`: (`list_files`, `read_file`, `search`, `delegate`, `log_brief`, `log_failure_detail`) —— 禁用 `run_shell`, `log_run` 及文件修改写工具，仅允许审查与记录简报。
+     - `skill_distill`: (`read_file`, `search`, `log_brief`, `log_failure_detail`) —— 收缩至检索与读取，准备沉淀 Skill Candidate。
+     - `handoff`: (`read_file`, `search`, `log_brief`) —— 最窄读取，仅输出交付结论。
+3. **Round 与 Tool 预算**：
+   - `code_change` 模版配置：`round_budget=12`, `tool_budget=40` (参见 [skillforge/workflow.py:189-190](file:///D:/Project/skill-forge/skillforge/workflow.py#L189-L190))。
+   - `round_budget`: 限制大模型请求的交互总轮数。
+   - `tool_budget`: 限制累计调用的工具执行总次数。
+4. **TaskPacket 编译、Prompt 嵌入与 Phase 推进**：
+   - 在每轮模型调用前，`SkillForge.ask()` 调用 `_compile_workflow_task_packet()` ([skillforge/runtime.py:1455-1465](file:///D:/Project/skill-forge/skillforge/runtime.py#L1455-L1465)) 编译生成 `TaskPacket`。
+   - `TaskPacket` 格式化后作为 `workflow_prompt_context` 被组装进 Prompt 的 `prefix` 段 ([skillforge/context_manager.py:123-124](file:///D:/Project/skill-forge/skillforge/context_manager.py#L123-L124))。
+   - 当模型返回文本，如果不包含工具调用，且解析到了最终回答（或者带有 `<final>` 标记），在 [skillforge/runtime.py:1613-1640](file:///D:/Project/skill-forge/skillforge/runtime.py#L1613-L1640) 中触发 `advance_phase()`，驱动 `WorkflowKernel` 向下一个 Phase 推进。
+
+### 证据产生与完成门
+
+1. **四类完成证据的产生点**：
+   - `diff` 证据：在 `implement` 阶段工具调用修改工作区后，由 [skillforge/runtime.py:1740-1840](file:///D:/Project/skill-forge/skillforge/runtime.py#L1740-L1840) 对比快照，并在 `_record_tool_evidence` ([skillforge/runtime.py:1880-1920](file:///D:/Project/skill-forge/skillforge/runtime.py#L1880-L1920)) 中由 `EvidenceStore` 记录。
+   - `verification` 证据：在 `verify` 阶段通过调用 `log_run` 运行测试命令后，在 [skillforge/runtime.py:1900-1910](file:///D:/Project/skill-forge/skillforge/runtime.py#L1900-L1910) 中产生。
+   - `audit` 证据：在 `audit` 阶段由 deterministic 规则函数 `audit_code_change()` ([skillforge/audit.py:205-226](file:///D:/Project/skill-forge/skillforge/audit.py#L205-L226)) 检查产生。
+   - `handoff` 证据：在最终 `handoff` 阶段完成交付总结时，由 `EvidenceStore.record_handoff()` 产生。
+2. **Audit 确定性检查与 `concerns` 的两种去向**：
+   - 确定性检查逻辑：[skillforge/audit.py:205-226](file:///D:/Project/skill-forge/skillforge/audit.py#L205-L226) 的 `audit_code_change()` 自动执行 4 个底线校验：
+     1) `_diff_check` ([skillforge/audit.py:67](file:///D:/Project/skill-forge/skillforge/audit.py#L67)): 确保有有效的 diff 路径；
+     2) `_verification_check` ([skillforge/audit.py:97](file:///D:/Project/skill-forge/skillforge/audit.py#L97)): 确保测试验证存在且 status 为 pass；
+     3) `_protected_path_check` ([skillforge/audit.py:139](file:///D:/Project/skill-forge/skillforge/audit.py#L139)): 确保未触及 `.git` 或 `.skillforge` 受保护路径；
+     4) `_skill_candidate_check` ([skillforge/audit.py:176](file:///D:/Project/skill-forge/skillforge/audit.py#L176)): 确保未激活处于 quarantine 的 candidate。
+   - `concerns` 两种去向：
+     - 去向 1：自动检测出的规则失败（`check.status == "fail"`）收集到 `AuditReport.concerns`，若非空则设定 audit 状态为 `"fail"` ([skillforge/audit.py:219-220](file:///D:/Project/skill-forge/skillforge/audit.py#L219-L220))。
+     - 去向 2：如果模型/审计记录手动写入带有 `status="concerns"` 的 audit 证据，则 `concerns` 列表被传递并要求必须非空 ([skillforge/workflow.py:998-1000](file:///D:/Project/skill-forge/skillforge/workflow.py#L998-L1000))。
+3. **Completion Gate 的作用**：
+   - 定义在 [skillforge/workflow.py:977-1020](file:///D:/Project/skill-forge/skillforge/workflow.py#L977-L1020)。
+   - 在到达 `handoff` 结束或评估工作流完成时被调用，强行对 `completion_requirements`（`diff`, `verification`, `audit`, `handoff`）逐项校验。不通过则阻止任务完成并标记为 `COMPLETION_GATE_BLOCKED`。
+4. **`skill_distill` 阶段与真实 Distill 时点 & Candidate 激活机制**：
+   - 时点关系：`skill_distill` 是 Workflow 规划的第 6 个 Phase ([skillforge/workflow.py:173](file:///D:/Project/skill-forge/skillforge/workflow.py#L173))；而真正的提取计算是在 Phase 推进期间由 `SkillDistiller.distill()` ([skillforge/skills.py:320-380](file:///D:/Project/skill-forge/skillforge/skills.py#L320-L380)) 结合已通过的 `verification` 和 `audit` 证据链执行落盘。
+   - 激活机制：提取出的 candidate 默认存储在 `quarantine` 槽位，其状态为 `"quarantine"` ([skillforge/skills.py:14](file:///D:/Project/skill-forge/skillforge/skills.py#L14))。 Candidate **绝不会**自动激活；必须经由 `PromotionGate` ([skillforge/skills.py:246](file:///D:/Project/skill-forge/skillforge/skills.py#L246)) 提交人工或确定性准入评估后才能提升为 `active` 状态。
+
+### 紧凑时序链
+
+```
+[CLI: main()/build_agent()]
+   │ (装配 Workspace, SessionStore, ModelClient, workflow="code_change")
+   ▼
+[Phase 1: intake] (允许: list_files, read_file, search)
+   │ 收集代码信息 -> 模型输出 final -> advance_phase()
+   ▼
+[Phase 2: plan_compile] (允许: list_files, read_file, search, delegate)
+   │ 编译方案 -> 模型输出 final -> advance_phase()
+   ▼
+[Phase 3: implement] (允许: 全量读写、run_shell、patch_file 等)
+   │ 执行代码修改 -> [产生 diff 证据] -> advance_phase()
+   ▼
+[Phase 4: verify] (禁用文件修改写工具，仅允许测试执行)
+   │ 运行 log_run pytest -> [产生 verification 证据] -> advance_phase()
+   ▼
+[Phase 5: audit] (禁用 run_shell / 写工具)
+   │ 运行 audit_code_change() -> [产生 audit 证据 (检查 4 类规则)] -> advance_phase()
+   ▼
+[Phase 6: skill_distill] (仅允许 read_file, search, log_brief)
+   │ SkillDistiller 校验证据链 -> 生成 Skill Candidate 存入 quarantine 槽位
+   ▼
+[Phase 7: handoff] (最窄读取)
+   │ 模型输出交付报告 -> [产生 handoff 证据] -> CompletionGate 强校验
+   ▼
+[CompletionGate.evaluate()] -> (4 类证据齐全且状态校验通过 -> 完成任务)
+```
+
+### 易误解细节
+
+1. **`verify` 阶段并不是随意写代码验证**：名称看起来叫验证，但真实行为中 `verify` 阶段被移除了 `write_file`, `patch_file` 和 `delegate` 权限 ([skillforge/workflow.py:853](file:///D:/Project/skill-forge/skillforge/workflow.py#L853))，模型无法在该阶段修正代码缺陷，必须退回 `implement` 阶段。
+2. **`CompletionGate` 并不只是“检查文件/证据存在性”**：虽然名称叫 Gate，但它在 [skillforge/workflow.py:990-1002](file:///D:/Project/skill-forge/skillforge/workflow.py#L990-L1002) 中会对 `verification` 的 payload 强制校验 `status in ("passed", "pass")`；对 `audit` 强制校验状态在 `AUDIT_ACCEPTED_STATUSES` 内，且若状态为 `concerns` 时还要求 `concerns` 数组必须非空，属于深度状态门禁。
+
+---
+
+## Q3｜长上下文预算、checkpoint 与 resume
+
+### Prompt 组装与压缩
+
+1. **Section 顺序与预算参数**：
+   - 组装固定顺序：`("prefix", "memory", "relevant_memory", "history", "current_request")` (参见 [skillforge/context_manager.py:28](file:///D:/Project/skill-forge/skillforge/context_manager.py#L28))。
+   - 默认预算 ([skillforge/context_manager.py:13-19](file:///D:/Project/skill-forge/skillforge/context_manager.py#L13-L19))：
+     - `total_budget`: `12000` 字符；
+     - `prefix`: `3600` 字符；`memory`: `1600` 字符；`relevant_memory`: `1200` 字符；`history`: `5200` 字符。
+   - Floor 计算方式：[skillforge/context_manager.py:226-232](file:///D:/Project/skill-forge/skillforge/context_manager.py#L226-L232) 中 `floors = {section: max(20, int(budget) // 4) ...}`，即默认为各自预算的 25%（最小 20），若存在 `section_floors` 参数则被显式覆写。
+   - 溢出收缩顺序 ([skillforge/context_manager.py:27](file:///D:/Project/skill-forge/skillforge/context_manager.py#L27))：`("relevant_memory", "history", "memory", "prefix")`。
+2. **当前请求是否绝对保证总 Prompt 不超预算**：
+   - 答案：**否**（无法绝对保证）。
+   - 原因：在 [skillforge/context_manager.py:154-179](file:///D:/Project/skill-forge/skillforge/context_manager.py#L154-L179) 的收缩循环中，仅针对 `reduction_order` 中的四个 section 进行截断。最新用户请求 `current_request` 永远不被裁减 ([skillforge/context_manager.py:153](file:///D:/Project/skill-forge/skillforge/context_manager.py#L153))。如果用户单次输入的 `user_message` 自身长度就超过了 `total_budget`，即使其他所有 section 均被压缩到了 floor，总 Prompt 字符数依然会突破 `total_budget`。
+3. **Relevant Memory 与 History 的处理与压缩**：
+   - Relevant memory：上限最多 3 条 ([skillforge/context_manager.py:30](file:///D:/Project/skill-forge/skillforge/context_manager.py#L30) `RELEVANT_MEMORY_LIMIT = 3`)。排序信号由 `(exact_tag_match, keyword_overlap, recency)` 三元组降序排列 ([skillforge/memory.py:157](file:///D:/Project/skill-forge/skillforge/memory.py#L157))。
+   - History 处理差异：以最近 6 条 ([skillforge/context_manager.py:324](file:///D:/Project/skill-forge/skillforge/context_manager.py#L324) `recent_window = 6`) 为分界线。最近 6 条为 `recent`，字符上限设为 900 并优先完整保留；早于 6 条的旧 history 格式化上限降为 60 字符，且在预算不足时会被进一步精简。
+   - 重复旧 `read_file` 压缩：在旧 history 中，相同路径的多次 `read_file` 只保留第一次的短摘要（若有），第二次及以后的重复读取记录被直接**折叠剔除** ([skillforge/context_manager.py:393-395](file:///D:/Project/skill-forge/skillforge/context_manager.py#L393-L395) `collapsed_duplicate_reads += 1`)。
+
+### Checkpoint / resume
+
+1. **模型调用前创建 Checkpoint 的三类情况**：
+   - 情况 1 (`freshness_mismatch`)：Key file 发生变动或过期 (`prompt_metadata["resume_status"] == "partial-stale"`) (参见 [skillforge/runtime.py:1483-1484](file:///D:/Project/skill-forge/skillforge/runtime.py#L1483-L1484))。
+   - 情况 2 (`workspace_mismatch`)：Runtime identity 关键字段不一致 (`prompt_metadata["resume_status"] == "workspace-mismatch"`) (参见 [skillforge/runtime.py:1494-1502](file:///D:/Project/skill-forge/skillforge/runtime.py#L1494-L1502))。
+   - 情况 3 (`context_reduction`)：Prompt 超出预算触发了上下文压缩 (`prompt_metadata.get("budget_reductions")` 非空) (参见 [skillforge/runtime.py:1512-1513](file:///D:/Project/skill-forge/skillforge/runtime.py#L1512-L1513))。
+2. **工具调用后与正常结束时的行为**：
+   - 每次工具执行后：触发 `create_checkpoint(..., trigger="tool_executed")` ([skillforge/runtime.py:1596](file:///D:/Project/skill-forge/skillforge/runtime.py#L1596))，更新 `task_state` 并发 `checkpoint_created` 追踪事件。
+   - 正常结束时：触发 `create_checkpoint(..., trigger="run_finished")` ([skillforge/runtime.py:1646](file:///D:/Project/skill-forge/skillforge/runtime.py#L1646))，持久化最终状态。
+3. **Resume 状态优先级与 Identity 比较字段**：
+   - 优先级规则：在 [skillforge/runtime.py:285-288](file:///D:/Project/skill-forge/skillforge/runtime.py#L285-L288) 中，`stale_paths` 优先于 `mismatch_fields` 被判断。因此当同时遇到 key file 过期和 runtime identity 不一致时，最终状态优先判定为 **`partial-stale`**（`CHECKPOINT_PARTIAL_STALE_STATUS`），而非 `workspace-mismatch`。
+   - 参加比较的 11 个 Identity 字段 ([skillforge/runtime.py:266-278](file:///D:/Project/skill-forge/skillforge/runtime.py#L266-L278))：
+     `"cwd"`, `"model"`, `"model_client"`, `"approval_policy"`, `"read_only"`, `"max_steps"`, `"max_new_tokens"`, `"feature_flags"`, `"shell_env_allowlist"`, `"workspace_fingerprint"`, `"tool_signature"`。
+
+### Artifact 职责
+
+- `task_state.json`：保存当前运行任务的最新的单点聚合状态快照（包括 status, progress, total_tokens, checkpoint_id, final_answer），供实时监控与恢复索引使用。
+- `trace.jsonl`：保存按时间顺序追加的细粒度结构化事件流水日志（如 `model_requested`, `tool_executed`, `checkpoint_created`），用于过程审计与调试分析。
+- `report.json`：保存任务运行完毕后的只读终态总结报告（包含耗时、token 统计、证据清单、评估结论），用于交付和结果汇报。
+- Session Checkpoint：保存特定历史时刻的全量运行时上下文凭据（包含 key_files 状态、runtime_identity、current_goal/blocker/next_step 及 memory 快照），专门用于跨会话断点续传（resume）。
+- **不能替代原因**：`task_state` 缺少完整历史事件流；`trace` 是非结构化追加日志无法直接快速反序列化恢复 Agent 内存状态；`report` 仅在结束时产生无法用于中途恢复。
+
+---
+
+## Q4｜SSE usage/cache Bug
+
+### 最小复现
+
+可以在 `/tmp/reproduce_q4.py` 中编写以下只读复现脚本直接调用 `_extract_openai_response_from_sse`：
+
+```python
+import sys
+sys.path.insert(0, "D:/Project/skill-forge")
+import json
+from skillforge.models import _extract_openai_response_from_sse
+
+# 模拟 OpenAI-compatible 后端标准的 SSE 事件流顺序
+sse_stream = """data: {"type": "response.output_text.delta", "delta": "Hello "}
+data: {"type": "response.output_text.delta", "delta": "World"}
+data: {"type": "response.output_text.done", "text": "Hello World"}
+data: {"type": "response.completed", "response": {"usage": {"input_tokens": 100, "output_tokens": 20, "input_tokens_details": {"cached_tokens": 80}}}}
+data: [DONE]
+"""
+
+text, response_data = _extract_openai_response_from_sse(sse_stream)
+print("Extracted Text:", repr(text))
+print("Extracted Response Data:", json.dumps(response_data))
+```
+
+- **实际运行输出**：
+  ```
+  Extracted Text: 'Hello World'
+  Extracted Response Data: {}
+  ```
+- **复现现象**：文本正确提取为 `'Hello World'`，但返回的 `response_data` 是空字典 `{}`，导致上层 `_extract_usage_cache_details(response_data)` 提取出的 `cached_tokens` 归零，`last_completion_metadata` 缺失 usage 统计。
+
+### 根因与漏测原因
+
+1. **精确根因定位**：
+   - 错误代码位置：[skillforge/models.py:194-197](file:///D:/Project/skill-forge/skillforge/models.py#L194-L197)（位于 `_extract_openai_response_from_sse()` 函数内）。
+   - 调用链：`SkillForge.ask()` ([skillforge/runtime.py:1460](file:///D:/Project/skill-forge/skillforge/runtime.py#L1460)) -> `OpenAICompatibleModelClient.complete()` ([skillforge/models.py:322](file:///D:/Project/skill-forge/skillforge/models.py#L322)) -> `_extract_openai_response_from_sse()` ([skillforge/models.py:194](file:///D:/Project/skill-forge/skillforge/models.py#L194)) -> `_extract_usage_cache_details()` ([skillforge/models.py:330](file:///D:/Project/skill-forge/skillforge/models.py#L330))。
+   - 原因解释：在 `_extract_openai_response_from_sse` 逐行解析 SSE 文本时，当解析到 `event_type == "response.output_text.done"` (194 行) 且 `event.get("text")` 有值时，代码执行了 `return text, last_response or {}` (197 行) **提前退出了循环**！而在标准的 SSE 事件流中，带 `usage` 载体的 `response.completed` 事件（185 行）是在 `response.output_text.done` 事件**之后**才被发送的。由于提前退出，循环根本没机会读取到后续的 `response.completed` 事件，导致 `last_response` 依旧为 `None`，返回的 `response_data` 为空字典 `{}`。
+2. **现有 SSE 测试漏测原因**：
+   现有的 SSE 单元测试在构造测试事件流数据时，把 `response.completed` 放在了 `response.output_text.done` 之前，或者仅测试了单包包含 `response.completed` 的非标准事件流，未覆盖真实服务端 `delta` -> `output_text.done` -> `response.completed` 的事件时序。
+
+### 修复与回归测试建议
+
+*(注意：仅提出修复方案，不实际修改代码)*
+
+1. **最小修复策略**：
+   - 修改 [skillforge/models.py:168-206](file:///D:/Project/skill-forge/skillforge/models.py#L168-L206) 的 `_extract_openai_response_from_sse` 函数：不要在遇到 `response.output_text.done` 时立即 return。
+   - 改为在遍历过程中保存解析到的 `done_text` 或拼接 `deltas`，并持续更新 `last_response`（当遇到 `event.get("type") == "response.completed"` 或 `event.get("response")` 时存入 `last_response`）。待遍历完所有 SSE 文本行后再统一返回 `(final_text, last_response or {})`。
+2. **回归测试断言设计**（至少包含以下断言与兼容要求）：
+   - **断言 1 (标准顺序带有 usage)**：传入 `delta` -> `done` -> `completed` 序列，断言 `response_data` 中包含 `usage` 且 `cached_tokens == 80`，`last_completion_metadata["cache_hit"] is True`。
+   - **断言 2 (无 completed 兼容)**：传入仅包含 `delta` 和 `done` 的 SSE 事件流，断言能正确返回文本，`response_data` 为 `{}` 且不抛出异常。
+   - **保留兼容行为**：保留非 SSE 格式（普通 JSON 响应）提取逻辑及不支持 `prompt_cache` 后端的平滑降级行为。
+
+---
+
+## Q5｜中文记忆召回 Bug
+
+### 最小复现
+
+可以在 `/tmp/reproduce_q5.py` 中编写以下只读复现脚本调用 `LayeredMemory`：
+
+```python
+import sys
+sys.path.insert(0, "D:/Project/skill-forge")
+import tempfile, pathlib
+from skillforge.memory import default_memory_state, DurableMemoryStore, retrieval_view
+
+tmp = pathlib.Path(tempfile.mkdtemp())
+durable_store = DurableMemoryStore(tmp / ".skillforge" / "memory")
+
+# 1. 写入中文 durable memory
+durable_store.promote([
+    ("project-conventions", "项目约定：优先使用受约束工具，不要靠猜。")
+])
+
+# 2. 用中文关键词进行召回查询
+state = default_memory_state()
+query = "受约束工具"
+result = retrieval_view(state, query, limit=3, workspace_root=tmp)
+
+print("Retrieval Result:\n" + result)
+```
+
+- **实际运行输出**：
+  ```
+  Retrieval Result:
+  Relevant memory:
+  - none
+  ```
+- **复现现象**：中文持久记忆成功写入了 `topics/project-conventions.md` 和 `MEMORY.md`，但使用 `"受约束工具"` 查询时返回 `Relevant memory:\n- none`。
+
+### 写入链路与召回根因
+
+1. **写入链路 vs 召回链路分析**：
+   - **写入链路**：`DurableMemoryStore.promote()` ([skillforge/memory.py:188-224](file:///D:/Project/skill-forge/skillforge/memory.py#L188-L224)) 将中文文本直接写入文件；`LayeredMemory.record_note()` ([skillforge/memory.py:451-469](file:///D:/Project/skill-forge/skillforge/memory.py#L451-L469)) 直接把中文字符串追加进 `state["episodic_notes"]`。写入链路对字符串无正则过滤，因此**写入 100% 成功**。
+   - **召回链路**：`retrieval_candidates()` ([skillforge/memory.py:519-547](file:///D:/Project/skill-forge/skillforge/memory.py#L519-L547)) 和 `DurableMemoryStore.retrieval_candidates()` ([skillforge/memory.py:144-159](file:///D:/Project/skill-forge/skillforge/memory.py#L144-L159)) 均调用 `_tokenize()` 函数对 `query`、`note.text` 及 `tags` 提取 Token 集合。
+2. **共同根因**：
+   - 错误代码位置：[skillforge/memory.py:282-283](file:///D:/Project/skill-forge/skillforge/memory.py#L282-L283)。
+   - `_tokenize(text)` 的具体实现为：
+     ```python
+     def _tokenize(text):
+         return {token.lower() for token in re.findall(r"[A-Za-z0-9_]+", str(text))}
+     ```
+   - 正则表达式 `r"[A-Za-z0-9_]+"` **仅匹配 ASCII 字母、数字和下划线**。当传入纯中文字符串（如 `"受约束工具"`）时，`re.findall` 返回空列表 `[]`，使得 `_tokenize` 返回空集合 `set()`。
+   - 在召回计算时，`exact_tag_match` 为 0，`keyword_overlap` 为 0。代码在 [skillforge/memory.py:154](file:///D:/Project/skill-forge/skillforge/memory.py#L154) 和 [skillforge/memory.py:530](file:///D:/Project/skill-forge/skillforge/memory.py#L530) 执行 `if exact_tag_match == 0 and keyword_overlap == 0: continue`，直接过滤并跳过了所有中文笔记，导致召回失败。
+3. **受影响范围**：Episodic Memory 和 Durable Memory 两条召回链路**均受影响**（因为两者共用 `_tokenize`）。
+
+### 修复与测试矩阵
+
+*(注意：仅提出修复方案，不实际修改代码)*
+
+1. **无需第三方依赖的最小修复方向**：
+   - 修改 [skillforge/memory.py:282-283](file:///D:/Project/skill-forge/skillforge/memory.py#L282-L283) 的 `_tokenize` 函数。扩展正则匹配以包含中文字符：
+     ```python
+     def _tokenize(text):
+         # 匹配英文/数字单词以及单个 CJK 中文字符（支持单字与词组重叠匹配）
+         tokens = set(token.lower() for token in re.findall(r"[A-Za-z0-9_]+", str(text)))
+         cjk_chars = set(re.findall(r"[\u4e00-\u9fff]", str(text)))
+         return tokens | cjk_chars
+     ```
+   - 保留现有的排序兼容要求：打分元组 `(exact_tag_match, keyword_overlap, recency, note_index)` 优先级与逆序排列逻辑保持不变。
+2. **测试矩阵设计**：
+   - **测试项 1 (英文 Tag/Text 匹配)**：验证既有英文检索（如 query="convention" 匹配 tag="convention"）不受影响。
+   - **测试项 2 (纯中文精确召回)**：写入 `"项目约定：优先使用受约束工具"`，查询 `"受约束工具"`，断言成功召回。
+   - **测试项 3 (中英混合召回)**：写入包含中英文混合的 Tag 或文本，验证交叉匹配能力。
+   - **测试项 4 (无关中文拒绝)**：查询不相干的中文关键词，断言正确返回 `- none`。
+
+---
+
+## Q6｜工具安全边界与残余风险
+
+### 护栏顺序与五类调用
+
+1. **护栏执行顺序**：
+   - 在 [skillforge/runtime.py:1738-1813](file:///D:/Project/skill-forge/skillforge/runtime.py#L1738-L1813) 的 `run_tool(name, args)` 中，护栏严格按以下顺序依次执行：
+     1) **工具存在性检查** ([skillforge/runtime.py:1741](file:///D:/Project/skill-forge/skillforge/runtime.py#L1741)): 检查 `tools.get(name)`；
+     2) **Workflow Phase 白名单校验** ([skillforge/runtime.py:1754-1770](file:///D:/Project/skill-forge/skillforge/runtime.py#L1754-L1770)): 校验当前 Phase 是否允许该工具；
+     3) **参数与路径校验 (`validate_tool`)** ([skillforge/runtime.py:1772-1789](file:///D:/Project/skill-forge/skillforge/runtime.py#L1772-L1789)): 执行路径 `resolve()`、相对路径校验及参数类型检查；
+     4) **重复调用保护 (`repeated_tool_call`)** ([skillforge/runtime.py:1790-1801](file:///D:/Project/skill-forge/skillforge/runtime.py#L1790-L1801)): 检查连续相同参数的工具调用；
+     5) **审批策略与 Read-only 检查 (`approve`)** ([skillforge/runtime.py:1802-1813](file:///D:/Project/skill-forge/skillforge/runtime.py#L1802-L1813)): 若为 risky 工具且在 `read_only` 模式下直接拦截并报 `approval_denied`。
+2. **五类调用的端到端安全分析**：
+   - **请求 `read_file ../outside.txt`**：在 `validate_tool` 阶段，调用 [skillforge/workspace.py:250](file:///D:/Project/skill-forge/skillforge/workspace.py#L250) `WorkspaceContext.path("../outside.txt")`。执行 `resolved = (repo_root / raw_path).resolve()`，因 `not resolved.is_relative_to(repo_root)` 抛出 `ValueError("path escapes workspace")` 被拦截。
+   - **指向仓库外的 Symlink**：`resolve()` 会递归解析软链接指向的物理真实路径，如果指向仓库外，同样不满足 `is_relative_to(repo_root)`，在 `validate_tool` 阶段被防护拦截。
+   - **`run_shell`**：需通过 Workflow Phase 白名单、`risky=True` 审批以及 `read_only=False` 校验。执行时受环境变量白名单和子进程超时限制。
+   - **`log_run pytest`**：通过 Phase 白名单及审批校验后执行。 raw log 隔离写入独立 evidence，提取简报返回。
+   - **Delegate**：在 [skillforge/tools.py:96](file:///D:/Project/skill-forge/skillforge/tools.py#L96) 校验 `agent.depth < agent.max_depth`。子 Agent 强制设为只读 (`read_only=True`)，无法调用写工具。
+
+### Evidence / delegate 边界
+
+1. **`log_run` 日志与证据隔离**：
+   - `log_run` 产生的原始输出写为独立文件（如 `.skillforge/runs/raw/log-*.txt`）。
+   - 模型在 Prompt 中只能看到 `Evidence Brief`；若需要详细单测报错，通过 `log_failure_detail` 精确读取指定的单条失败详情，避免海量日志占满上下文窗口。
+   - 产生 `verification` 证据的时机：在 `log_run` 执行完毕并提取解析出退出码和简报后，在 `EvidenceStore` 中生成 `record_type="verification"` 的记录。
+2. **Delegate 的深度、只读边界与 TaskPacket 锁定**：
+   - 深度边界：由 `agent.depth` 控制，一旦达到 `max_depth`，`delegate` 工具自动从工具表中移除 ([skillforge/tools.py:96](file:///D:/Project/skill-forge/skillforge/tools.py#L96))。
+   - 只读边界：子 Agent 强制设置 `read_only=True`，不可执行修改工作区的动作。
+   - TaskPacket 锁定：子 Agent 继承父 Agent 的 TaskPacket 约束与阶段上下文，防止子 Agent 脱离主 TaskPacket 轨道。
+
+### 残余风险或局限
+
+*(注：基于代码事实与证据，非假漏洞)*
+
+1. **`run_shell` 命令缺乏 AST / 语法级别的 Shell 命令注入防护**：
+   - **代码证据**：[skillforge/tools.py:35-39](file:///D:/Project/skill-forge/skillforge/tools.py#L35-L39) 及 `tool_run_shell` 的实现。
+   - **风险描述**：`run_shell` 接受任意 command 字符串并交由 Shell 运行。一旦通过审批/处于自动模式，模型可构造包含命令连接符（如 `;`、`&&`、`|`、子 Shell 替换 `$()`）的复杂命令，绕过命令单一性预期并在根目录下运行非预期的 Shell 操作。
+2. **`repeated_tool_call` 的死循环防护容易被交替参数绕过**：
+   - **代码证据**：[skillforge/runtime.py:1868-1875](file:///D:/Project/skill-forge/skillforge/runtime.py#L1868-L1875) (`tool_events[-1]` 与当前调用完全一致才触发)。
+   - **局限描述**：重复调用检测仅比对最近一次的工具名称和参数。如果模型在两个工具参数之间交替调用（如 A -> B -> A -> B），或在两次重复调用间穿插一个无害的 `list_files`，死循环保护机制将完全失效。
+
+---
+
+## Q7｜事实核验矩阵
+
+| # | 判定 | 一句解释 | 代码证据 |
+|---|---|---|---|
+| 1 | 假 | 最新用户请求 `current_request` 永远不被裁减，若其字符数本身大于 `total_budget`，总 Prompt 仍会超预算。 | [skillforge/context_manager.py:27](file:///D:/Project/skill-forge/skillforge/context_manager.py#L27), [skillforge/context_manager.py:154](file:///D:/Project/skill-forge/skillforge/context_manager.py#L154) |
+| 2 | 假 | `repo_audit` 的 `investigate` 阶段工具白名单仅含 `list_files`, `read_file`, `search`, `log_brief`, `log_failure_detail`，禁用 `log_run`。 | [skillforge/workflow.py:834](file:///D:/Project/skill-forge/skillforge/workflow.py#L834) |
+| 3 | 假 | 连续第二次发起完全相同的工具调用时即被 `repeated_tool_call` 拦截拒绝，不需要等到第三次。 | [skillforge/runtime.py:1868-1875](file:///D:/Project/skill-forge/skillforge/runtime.py#L1868-L1875) |
+| 4 | 假 | 仅在 `base_url` 包含 `"openai.com"` 或 `"right.codes"` 时才启用 Prompt Cache，其余 URL 不启用。 | [skillforge/models.py:235](file:///D:/Project/skill-forge/skillforge/models.py#L235) |
+| 5 | 假 | raw log 策略为 `"raw_logs_to_evidence_only"`，原始日志写独立文件，Prompt 中仅包含简短 Brief。 | [skillforge/workflow.py:187](file:///D:/Project/skill-forge/skillforge/workflow.py#L187), [skillforge/workflow.py:964](file:///D:/Project/skill-forge/skillforge/workflow.py#L964) |
+| 6 | 假 | `evaluate_resume_state` 优先判断 `stale_paths`，若存在过期文件状态为 `partial-stale`，而非 `workspace-mismatch`。 | [skillforge/runtime.py:285-288](file:///D:/Project/skill-forge/skillforge/runtime.py#L285-L288) |
+| 7 | 假 | Candidate 提取后存入 quarantine 槽位且状态为 `"quarantine"`，必须经 `PromotionGate` 评估后才能激活。 | [skillforge/skills.py:14](file:///D:/Project/skill-forge/skillforge/skills.py#L14), [skillforge/skills.py:246](file:///D:/Project/skill-forge/skillforge/skills.py#L246) |
+| 8 | 假 | `read_file` 完整文本保存在 session history 中；复制到 working memory 时经 `summarize_read_result` 截断为最多 180 字符的摘要。 | [skillforge/memory.py:505-516](file:///D:/Project/skill-forge/skillforge/memory.py#L505-L516) |
+| 9 | 真 | 当 `run_shell` exit code 非零且工作区产生文件修改 (`workspace_changed=True`) 时，`tool_status` 显式设为 `"partial_success"`。 | [skillforge/runtime.py:1826-1827](file:///D:/Project/skill-forge/skillforge/runtime.py#L1826-L1827) |
+| 10 | 假 | `CompletionGate` 深度校验 `verification` 的 status 必须为 `"passed"`/`"pass"`，及 `audit` 的 status 必须属于 `AUDIT_ACCEPTED_STATUSES` 且非空。 | [skillforge/workflow.py:990-1002](file:///D:/Project/skill-forge/skillforge/workflow.py#L990-L1002) |
+
+---
+
+## 最终自检
+
+### 主要读取文件
+
+1. `agent-eval/questions.md`
+2. `agent-eval/answer-template.md`
+3. `agent-eval/scoring-rubric.md`
+4. `agent-eval/snapshot-manifest.md`
+5. [pyproject.toml](file:///D:/Project/skill-forge/pyproject.toml)
+6. [skillforge/cli.py](file:///D:/Project/skill-forge/skillforge/cli.py)
+7. [skillforge/runtime.py](file:///D:/Project/skill-forge/skillforge/runtime.py)
+8. [skillforge/workflow.py](file:///D:/Project/skill-forge/skillforge/workflow.py)
+9. [skillforge/context_manager.py](file:///D:/Project/skill-forge/skillforge/context_manager.py)
+10. [skillforge/models.py](file:///D:/Project/skill-forge/skillforge/models.py)
+11. [skillforge/memory.py](file:///D:/Project/skill-forge/skillforge/memory.py)
+12. [skillforge/tools.py](file:///D:/Project/skill-forge/skillforge/tools.py)
+13. [skillforge/skills.py](file:///D:/Project/skill-forge/skillforge/skills.py)
+14. [skillforge/audit.py](file:///D:/Project/skill-forge/skillforge/audit.py)
+15. [tests/test_pico.py](file:///D:/Project/skill-forge/tests/test_pico.py)
+
+### 命令与退出码
+
+1. **`python -m pytest --collect-only -q`**
+   - 退出码：`1`
+   - 关键输出：`207 tests collected, 8 errors in 0.45s` (嵌套旧仓库 `pico_coding-agent-main` 收集报错)。
+2. **`python -m pytest tests -q`**
+   - 退出码：`1`
+   - 关键输出：`206 passed, 1 failed in 0.98s` (唯一失败项 `test_welcome_screen_keeps_box_shape_for_long_paths`)。
+3. **`python -m pytest tests/test_pico.py -k test_welcome_screen_keeps_box_shape_for_long_paths`**
+   - 退出码：`1`
+   - 关键输出：`AssertionError: assert 3 == 1 (where 3 = len({80, 89, 95}))`。
+4. **`python C:\Users\Yak\AppData\Local\Temp\reproduce_q4.py`**
+   - 退出码：`0`
+   - 关键输出：`Extracted Text: 'Hello World'`, `Extracted Response Data: {}` (成功稳定复现 SSE response_data 缺失)。
+5. **`python C:\Users\Yak\AppData\Local\Temp\reproduce_q5.py`**
+   - 退出码：`0`
+   - 关键输出：`Relevant memory:\n- none` (成功稳定复现纯中文持久记忆召回失败)。
+
+### 未验证事项
+
+1. **跨平台（Linux/macOS）下 ANSI 控制字符对终端列宽的真实渲染差异**：仅在本机 Windows 环境下通过 Python `len()` 和 pytest 进行了测试验证，未在真实的 Linux Terminal 渲染器下校验其物理显示列数。
+2. **与线上真实 OpenAI / DeepSeek SSE 接口的实际 HTTP 网络交互**：按评测规则 3 & 4 严格禁止联网，所有 SSE 复现均使用只读 mock 数据流。
+
+### 最可能出错的三个结论
+
+1. **Q1 中关于 ANSI 转义字符导致 `len()` 增加的结论**：
+   - 原因：若终端库（如 `colorama` 或某些 Rich 包装）在特定环境下被自动 monkey-patch，可能会改变字符串或输出处理，但在源码 [skillforge/cli.py:226](file:///D:/Project/skill-forge/skillforge/cli.py#L226) 中 `replace` 显式使用了原始转义字符，且 Python `len()` 对 `str` 的行为固定，该结论极具置信度。
+2. **Q3 中同时存在 stale file 和 identity mismatch 时 resume 状态优先级的结论**：
+   - 原因：逻辑存在多个 if/elif 分支，若后续代码重构或存在隐含的清理钩子（如 `invalidate_stale_memory` 的副作用），可能影响分支到达顺序。但按当前 [skillforge/runtime.py:285-288](file:///D:/Project/skill-forge/skillforge/runtime.py#L285-L288) 的源码结构，`if stale_paths:` 必定优先触发。
+3. **Q5 中 `_tokenize` 正则修正方案对大语料库召回精确度的影响**：
+   - 原因：将中文拆分为单字 Token (`\u4e00-\u9fff`) 虽能保障 100% 召回，但在中文词汇量极大的情况下可能增加关键词重叠的伪阳性（Keyword overlap false positives）。实际生产中可能需要做 Bigram 拆分或集成结巴分词。

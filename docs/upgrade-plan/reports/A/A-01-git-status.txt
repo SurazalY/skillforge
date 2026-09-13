@@ -1,0 +1,74 @@
+# A-01 工作区清单（去敏）
+# 采集时间：2026-09-13
+# 说明：本仓库没有 .git，无法产出 git status / git diff --stat。
+# 本文件是工作区快照清单，不是 git 输出。不含 .env 内容、不含密钥。
+
+Windows_root=D:\Project\SkillForge_0912
+WSL_root=/mnt/d/Project/SkillForge_0912
+git_repository=no
+.git_directory=missing
+HEAD=n/a
+branch=n/a
+remote=none
+dirty_classification=n/a (no index; entire tree is the working copy)
+
+# git 命令原文（只读）
+# git rev-parse --is-inside-work-tree
+#   fatal: not a git repository (or any of the parent directories): .git
+# WSL 同路径：
+#   fatal: not a git repository (or any parent up to mount point /mnt)
+
+# 敏感文件（只记名，未展开）
+.env  # 含敏感信息，未展开；501 bytes; LastWriteTime=2026-06-29 16:37:54
+
+# 身份文件 SHA256
+64E822687FFCEC260897A0365350CE3EC9A19CE8796CFE20CDD69BC24DD627B8  pyproject.toml
+8D56B198C6DDD9E6E15B36897F7048960044E55FFED8FC807B2A5AAD68EE69C5  README.md
+042676079F63618A53F1794BB47EC46712E18D82302D0E2421F92F268D455516  .gitignore
+5BC3859A57E0D80F8FAE7F0F5C91576656171F58426AC5D8A02D1A0276412E6C  skillforge\cli.py
+40FFB0CA98983CD8ABECFDA8487BF94157C840642FEE88861AE61FD1223C47A3  skillforge\__init__.py
+9C17E9517CD22DBA7CF09C9C085F33F3EF72A235B67700E77F08710FB991C705  SkillForge_Upgrade_Design.md
+0C6B72C3AA9839356654D565066FDF3451E7528D8235D0324D32B02F2202EDC3  docs\upgrade-plan\SHA256SUMS.txt
+
+# 按 .gitignore 意图分类（预测，不是 git 实测）
+# 典型应保留的用户/源码内容（请勿覆盖）
+skillforge/                 files=36   # 含 __pycache__ 18
+tests/                      files=30   # 含 __pycache__ 14
+pyproject.toml
+README.md
+.gitignore
+.env.example
+minimal_demo.py
+scripts/                    files=3
+benchmarks/                 files=1
+assets/                     files=3
+agent-eval/                 files=9
+SkillForge_Upgrade_Design.md
+SkillForge_Resume_Revision_2026-09-08.zip
+SkillForge_Upgrade_Addendum_2026-09-12.zip
+pico_coding-agent-main/     files=43
+pico_coding-agent-main.zip
+
+# .gitignore 声明忽略、但仍存在于工作区（只记录，不要删除）
+.env                        # secrets
+docs/                       files=59  # 含 upgrade-plan 与历史文档；整棵 docs/ 被忽略
+.pytest_cache/              files=5
+skillforge/__pycache__/     files=18
+tests/__pycache__/           files=14
+.skillforge/                files=52  # 本地 run/session 工件
+readme_intro_locked/        files=7  # 本地 scratch / 评测锁定目录
+
+# 不存在
+.venv/
+.ruff_cache/
+.git/
+AGENTS.md
+CLAUDE.md
+.cursor/
+.cursorrules
+uv.lock
+
+# 嵌套仓库
+pico_coding-agent-main/.git = missing
+pico_coding-agent-main/coding-agent-main/.git = missing
+D:\Project\.git = missing

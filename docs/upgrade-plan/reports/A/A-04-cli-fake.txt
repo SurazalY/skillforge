@@ -1,0 +1,48 @@
+# A-04 fake CLI recipes (offline)
+# date: 2026-09-13
+# interpreter: D:\IDE\python\python.exe (Python 3.12.10)
+# provider: fake
+# online: no
+# did not write to repo-root .skillforge/ (still 52 files)
+# secrets: none (welcome/report may list secret *names*, not values)
+
+## one-shot
+cwd: D:\Project\SkillForge_0912\.tmp_a04_cli
+env: SKILLFORGE_FAKE_OUTPUTS=["<final>A04-fake-oneshot-ok</final>"]
+command:
+  python -m skillforge --cwd D:\Project\SkillForge_0912\.tmp_a04_cli --provider fake --approval never --max-steps 1 "A04 fake one-shot ping"
+exit: 0
+printed_final: A04-fake-oneshot-ok
+session_id: 20260913-110145-a5d965
+run_id: run_20260913-110145-ee1c1e
+resume_status: no-checkpoint
+stop_reason: final_answer_returned
+prompt_cache_supported: false
+prompt_over_budget: false
+
+## resume latest
+cwd: same
+env: SKILLFORGE_FAKE_OUTPUTS=["<final>A04-fake-resume-ok</final>"]
+command:
+  python -m skillforge --cwd D:\Project\SkillForge_0912\.tmp_a04_cli --provider fake --approval never --max-steps 1 --resume latest "A04 resume continue"
+exit: 0
+printed_final: A04-fake-resume-ok
+session_id: 20260913-110145-a5d965  (same as one-shot)
+run_id: run_20260913-110152-eacaa1
+resume_status: full-valid
+stop_reason: final_answer_returned
+
+## REPL
+cwd: D:\Project\SkillForge_0912\.tmp_a04_repl
+input file: .tmp_a04_repl_input.txt  (/help, /session, /exit)
+command:
+  Get-Content .tmp_a04_repl_input.txt | python -m skillforge --cwd D:\Project\SkillForge_0912\.tmp_a04_repl --provider fake --approval never
+exit: 0
+prompt: skillforge>
+observed: /help lists commands; /session prints session json path; /exit ends
+session_id: 20260913-110204-420e51
+
+## --workflow
+NOT_RUN (cost/scope: argparse exists; real CLI template run left as recipe)
+nodeid already covering flag parse: test_cli_build_agent_accepts_workflow_flag PASSED
+runtime fake workflow invariant: test_test_fix_verify_phase_unparsed_log_does_not_create_verification_pass PASSED

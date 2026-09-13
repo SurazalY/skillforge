@@ -1,0 +1,64 @@
+# A-04 offline pytest (Windows)
+# date: 2026-09-13
+# cwd: D:\Project\SkillForge_0912
+# interpreter: D:\IDE\python\python.exe (Python 3.12.10)
+# pytest: 9.0.2
+# online: no
+# secrets: none
+
+command:
+  python -m pytest -v --tb=short --no-header \
+    tests/test_pico.py::test_openai_compatible_client_posts_expected_responses_payload \
+    tests/test_pico.py::test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage \
+    tests/test_pico.py::test_agent_accepts_xml_write_file_tool \
+    tests/test_pico.py::test_patch_file_replaces_exact_match \
+    tests/test_pico.py::test_agent_saves_and_resumes_session \
+    tests/test_pico.py::test_prompt_budget_metadata_records_budget_decisions \
+    tests/test_pico.py::test_recent_transcript_entries_stay_richer_than_older_ones \
+    tests/test_pico.py::test_fake_provider_one_shot_writes_skillforge_artifacts \
+    tests/test_pico.py::test_repeated_identical_tool_call_is_rejected \
+    tests/test_safety_invariants.py::test_workspace_escape_is_rejected \
+    tests/test_safety_invariants.py::test_symlink_path_traversal_is_rejected \
+    tests/test_safety_invariants.py::test_delegate_child_is_read_only \
+    tests/test_fusion_workflow.py::test_log_run_falls_back_for_non_pytest_commands_and_never_marks_pass \
+    tests/test_fusion_workflow.py::test_completion_gate_requires_diff_verification_audit_and_handoff \
+    tests/test_fusion_workflow.py::test_completion_gate_distinguishes_workflow_requirements_and_rejects_unparsed_log_as_verification \
+    tests/test_fusion_workflow.py::test_test_fix_verify_phase_unparsed_log_does_not_create_verification_pass \
+    tests/test_fusion_workflow.py::test_cli_build_agent_accepts_workflow_flag
+
+results:
+  collected: 17
+  passed: 15
+  failed: 2
+  duration_s: 6.81
+
+PASSED:
+  test_openai_compatible_client_posts_expected_responses_payload
+  test_openai_compatible_client_sends_prompt_cache_fields_and_records_usage
+  test_agent_accepts_xml_write_file_tool
+  test_patch_file_replaces_exact_match
+  test_agent_saves_and_resumes_session
+  test_prompt_budget_metadata_records_budget_decisions
+  test_recent_transcript_entries_stay_richer_than_older_ones
+  test_fake_provider_one_shot_writes_skillforge_artifacts
+  test_repeated_identical_tool_call_is_rejected
+  test_workspace_escape_is_rejected
+  test_delegate_child_is_read_only
+  test_completion_gate_requires_diff_verification_audit_and_handoff
+  test_completion_gate_distinguishes_workflow_requirements_and_rejects_unparsed_log_as_verification
+  test_test_fix_verify_phase_unparsed_log_does_not_create_verification_pass
+  test_cli_build_agent_accepts_workflow_flag
+
+FAILED (current baseline known failures on this Windows account; not fixed):
+  tests/test_safety_invariants.py::test_symlink_path_traversal_is_rejected
+    OSError: [WinError 1314] privilege not held (cannot create symlink)
+    fixture could not construct the symlink; product path check was not exercised
+  tests/test_fusion_workflow.py::test_log_run_falls_back_for_non_pytest_commands_and_never_marks_pass
+    FileNotFoundError: [WinError 2] /bin/echo does not exist on Windows
+    Unix fixture; product unparsed-never-pass logic was not reached
+
+notes:
+  - traceback displayed a sibling relative path ..\skill-forge\tests\...
+    collection was still this workspace tests/ via the commands above
+  - these two nodeids PASSED on WSL (see A-04-pytest-wsl.txt)
+  - no product assertions were changed

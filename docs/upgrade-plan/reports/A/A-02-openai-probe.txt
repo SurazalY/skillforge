@@ -1,0 +1,54 @@
+# A-02 OpenAI 协议探测摘要（去敏）
+# 日期：2026-09-13
+# 入口：skillforge.cli.main（--provider openai），隔离 cwd=.tmp_a02_openai
+# 逻辑探测次数：1 次 CLI 调用
+# HTTP 尝试：3（客户端内置重试，非另换凭据）
+#   1) POST /v1/responses -> RemoteDisconnected
+#   2) POST /v1/responses -> HTTP 503（JSON error 对象，未展开）
+#   3) POST /v1/responses -> HTTP 200
+# 未打印 Authorization / API key / 完整含密钥 URL。
+
+request:
+  method: POST
+  scheme_host: https://codexapis.com
+  path: /v1/responses
+  has_query: false
+  has_userinfo: false
+  headers: accept, authorization, content-type, user-agent
+  payload_keys: input, max_output_tokens, model, stream, temperature
+  stream: false
+  has_tools: false
+  has_functions: false
+  has_messages: false
+  has_prompt: false
+  prompt_cache_key_sent: false
+  model: gpt-5.5
+  max_output_tokens: 32
+
+successful_response:
+  http_status: 200
+  content_type: application/json
+  sse: false
+  body_startswith_data: false
+  usage_present: true
+  usage_keys: attribution, input_tokens, input_tokens_details, output_tokens, output_tokens_details, total_tokens
+  cache_fields: present (input_tokens_details.cached_tokens)
+  completion_metadata_from_trace:
+    prompt_cache_supported: false
+    prompt_cache_key: null
+    cache_hit: true
+    cached_tokens: 3840
+    input_tokens: 5354
+    output_tokens: 14
+    total_tokens: 5368
+  cli_exit: 0
+  final_answer: A02-ping-ok
+  duration_ms: 89342
+
+notes:
+  - 这是供应商 HTTP 调用，不是 SkillForge 对外 SSE/HTTP 服务。
+  - 请求体是 OpenAI Responses 形态（input / input_text），不是 /chat/completions。
+  - 未发送 tools/functions；工具动作由模型文本里的 <tool> 标签在 runtime 解析。
+  - SkillForge 仅在 base_url 含 openai.com 或 right.codes 时发送 prompt_cache_key；
+    当前 host 为 codexapis.com，故未发送 cache key，但响应仍带 cached_tokens。
+  - 禁止把 fake 结果记成这次在线 PASS。本次在线是真实 HTTP 200。
