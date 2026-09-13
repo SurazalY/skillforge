@@ -9,6 +9,20 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .compaction import (
+    DEFAULT_INPUT_CAP_I,
+    DEFAULT_MARGIN_M,
+    DEFAULT_RESERVED_R,
+    DEFAULT_SOFT_RATIO,
+    DEFAULT_WINDOW_W,
+    TOKEN_ESTIMATE_SOURCE,
+    current_compaction,
+    evaluate_admission,
+    group_history,
+    remaining_rounds_heuristic,
+)
+from .prompt_manifest import STABLE_BOUNDARY
+
 
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
@@ -65,6 +79,11 @@ class ContextManager:
         section_budgets=None,
         section_floors=None,
         reduction_order=None,
+        token_window_w=DEFAULT_WINDOW_W,
+        token_input_cap=DEFAULT_INPUT_CAP_I,
+        token_reserved=DEFAULT_RESERVED_R,
+        token_margin=DEFAULT_MARGIN_M,
+        token_soft_ratio=DEFAULT_SOFT_RATIO,
     ):
         self.agent = agent
         self.total_budget = int(total_budget)
@@ -74,6 +93,11 @@ class ContextManager:
         self._section_floor_overrides = {str(key): int(value) for key, value in (section_floors or {}).items()}
         self.section_floors = self._compute_section_floors()
         self.reduction_order = tuple(reduction_order or DEFAULT_REDUCTION_ORDER)
+        self.token_window_w = int(token_window_w)
+        self.token_input_cap = int(token_input_cap)
+        self.token_reserved = int(token_reserved)
+        self.token_margin = int(token_margin)
+        self.token_soft_ratio = float(token_soft_ratio)
 
     def build(self, user_message):
         """按预算组装一轮完整 prompt。
@@ -111,26 +135,14 @@ class ContextManager:
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
-        checkpoint_text = ""
-        if hasattr(self.agent, "render_checkpoint_text"):
-            checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
-        workflow_prompt_context = ""
-        if hasattr(self.agent, "render_workflow_prompt_context"):
-            workflow_prompt_context = str(self.agent.render_workflow_prompt_context() or "").strip()
-        prefix_extras = []
-        if checkpoint_text:
-            prefix_extras.append(checkpoint_text)
-        if workflow_prompt_context:
-            prefix_extras.append("Workflow task packet:\n" + workflow_prompt_context)
-        if prefix_extras:
-            section_texts["prefix"] = "\n\n".join(prefix_extras + [section_texts["prefix"]])
+        dynamic_text = self._dynamic_tail_text()
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
 
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
-            prompt = self._assemble_prompt(rendered)
+            prompt = self._assemble_prompt(rendered, dynamic_text=dynamic_text)
             metadata = self._metadata(
                 prompt=prompt,
                 rendered=rendered,
@@ -139,18 +151,20 @@ class ContextManager:
                 selected_notes=selected_notes,
                 user_message=user_message,
                 section_texts=section_texts,
+                dynamic_text=dynamic_text,
             )
             return prompt, metadata
 
         budgets = dict(self.section_budgets)
         rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
-        prompt = self._assemble_prompt(rendered)
+        prompt = self._assemble_prompt(rendered, include_dynamic=False)
         reduction_log = []
 
         # 如果 prompt 超预算，就按固定顺序不断压缩。
         # 这里的顺序体现了平台偏好：
         # 先牺牲 relevant_memory，再牺牲 history，然后才动 memory 和 prefix。
         # 最新用户请求永远不裁剪，因为那是本轮最重要的输入。
+        # 动态尾部不参与收缩，以免 checkpoint / git status 把 relevant_memory 额外压扁。
         while len(prompt) > self.total_budget:
             overflow = len(prompt) - self.total_budget
             reduced = False
@@ -172,12 +186,13 @@ class ContextManager:
                 )
                 budgets[section] = new_budget
                 rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
-                prompt = self._assemble_prompt(rendered)
+                prompt = self._assemble_prompt(rendered, include_dynamic=False)
                 reduced = True
                 break
             if not reduced:
                 break
 
+        prompt = self._assemble_prompt(rendered, dynamic_text=dynamic_text, include_dynamic=True)
         metadata = self._metadata(
             prompt=prompt,
             rendered=rendered,
@@ -186,6 +201,7 @@ class ContextManager:
             selected_notes=selected_notes,
             user_message=user_message,
             section_texts=section_texts,
+            dynamic_text=dynamic_text,
         )
         return prompt, metadata
 
@@ -197,7 +213,7 @@ class ContextManager:
         else:
             relevant_lines.append("- none")
         relevant_raw = "\n".join(relevant_lines)
-        history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._view_history()
         history_raw = self._raw_history_text(history)
         return {
             "prefix": SectionRender(raw=section_texts["prefix"], budget=len(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
@@ -302,8 +318,19 @@ class ContextManager:
         usable = max(0, budget - overhead)
         return max(1, usable // note_count)
 
+    def _view_history(self):
+        """模型视图 V：压缩覆盖的区间不再进入 transcript，原文仍留在 E。"""
+        history = list(getattr(self.agent, "session", {}).get("history", []) or [])
+        checkpoint = current_compaction(getattr(self.agent, "session", {}) or {})
+        if not checkpoint:
+            return history
+        through = checkpoint.get("source_through_seq")
+        if through is None:
+            return history
+        return [item for index, item in enumerate(history) if index > int(through)]
+
     def _render_history_section(self, budget):
-        history = list(getattr(self.agent, "session", {}).get("history", []))
+        history = self._view_history()
         raw = self._raw_history_text(history)
         if not history:
             rendered = "Transcript:\n- empty"
@@ -317,20 +344,27 @@ class ContextManager:
                     "collapsed_duplicate_reads": 0,
                     "reused_file_summary_count": 0,
                     "summarized_tool_count": 0,
+                    "open_groups_preserved": 0,
                 },
             )
 
         # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
+        # 保留单元是完整交互组：未闭合组整组留下，不按单条切断。
         recent_window = 6
         recent_start = max(0, len(history) - recent_window)
         history_entries, history_details = self._compressed_history_entries(history, recent_start)
         rendered_entries = []
         for entry in reversed(history_entries):
             recent = bool(entry.get("recent", False))
+            protected = bool(entry.get("protected", False))
             candidate_lines = list(entry.get("lines", []))
             candidate_entries = candidate_lines + rendered_entries
             candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
             if len(candidate_rendered) <= budget:
+                rendered_entries = candidate_entries
+                continue
+            if protected:
+                # 未闭合组 / 待审批：即使超预算也整组保留，不拆调用与结果。
                 rendered_entries = candidate_entries
                 continue
             if recent:
@@ -351,7 +385,8 @@ class ContextManager:
                     rendered_entries = smaller_entries
         rendered = "\n".join(["Transcript:", *rendered_entries])
 
-        if len(rendered) > budget and budget > 0:
+        # 保护组存在时不要用原文尾部裁剪把调用组切断。
+        if len(rendered) > budget and budget > 0 and not history_details.get("open_groups_preserved"):
             rendered = _tail_clip(raw, budget)
 
         return SectionRender(
@@ -374,41 +409,50 @@ class ContextManager:
             "collapsed_duplicate_reads": 0,
             "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
+            "open_groups_preserved": 0,
         }
+        groups = group_history(history)
 
-        for index, item in enumerate(history):
-            recent = index >= recent_start
+        for group in groups:
+            protected = (not group.closed) or group.pending_approval
+            recent = group.seq_end >= recent_start
+            if protected:
+                details["open_groups_preserved"] += 1
+                lines = []
+                for item in group.items:
+                    lines.extend(self._render_history_item(item, 900))
+                entries.append({"recent": True, "protected": True, "lines": lines, "group_id": group.group_id})
+                continue
             if recent:
-                line_limit = 900
-                entries.append(
-                    {
-                        "recent": True,
-                        "lines": self._render_history_item(item, line_limit),
-                    }
-                )
+                lines = []
+                for item in group.items:
+                    lines.extend(self._render_history_item(item, 900))
+                entries.append({"recent": True, "protected": False, "lines": lines, "group_id": group.group_id})
                 continue
 
-            if item["role"] == "tool" and item["name"] == "read_file":
-                path = str(item["args"].get("path", "")).strip()
-                if path in seen_older_reads:
-                    details["collapsed_duplicate_reads"] += 1
-                    continue
-                seen_older_reads.add(path)
-                summary = self._reusable_file_summary(path)
-                if summary:
-                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
+            group_lines = []
+            for item in group.items:
+                if item.get("role") == "tool" and item.get("name") == "read_file":
+                    path = str((item.get("args") or {}).get("path", "")).strip()
+                    if path in seen_older_reads:
+                        details["collapsed_duplicate_reads"] += 1
+                        continue
+                    if path:
+                        seen_older_reads.add(path)
+                    summary = self._reusable_file_summary(path)
+                    if summary:
+                        group_lines.append(f"{path} -> {summary}")
+                        details["reused_file_summary_count"] += 1
+                        details["older_entries_count"] += 1
+                        continue
+                if item.get("role") == "tool":
+                    group_lines.append(self._summarize_old_tool_item(item))
                     details["older_entries_count"] += 1
-                    details["reused_file_summary_count"] += 1
+                    details["summarized_tool_count"] += 1
                     continue
-
-            if item["role"] == "tool":
-                summary_line = self._summarize_old_tool_item(item)
-                entries.append({"recent": False, "lines": [summary_line]})
-                details["older_entries_count"] += 1
-                details["summarized_tool_count"] += 1
-                continue
-
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
+                group_lines.extend(self._render_history_item(item, 60))
+            if group_lines:
+                entries.append({"recent": False, "protected": False, "lines": group_lines, "group_id": group.group_id})
 
         return entries, details
 
@@ -443,25 +487,63 @@ class ContextManager:
         return "\n".join(["Transcript:", *lines])
 
     def _render_history_item(self, item, line_limit):
-        if item["role"] == "tool":
-            prefix = f"[tool:{item['name']}] {json.dumps(item['args'], sort_keys=True)}"
-            content = _tail_clip(item["content"], max(20, line_limit))
+        if item.get("role") == "tool":
+            prefix = f"[tool:{item['name']}] {json.dumps(item.get('args') or {}, sort_keys=True)}"
+            if item.get("call_id"):
+                prefix += f" call_id={item['call_id']}"
+            content = _tail_clip(item.get("content", ""), max(20, line_limit))
             return [prefix, content]
-        return [f"[{item['role']}] {_tail_clip(item['content'], line_limit)}"]
+        lines = [f"[{item.get('role')}] {_tail_clip(item.get('content', ''), line_limit)}"]
+        tool_calls = item.get("tool_calls") or ()
+        if tool_calls:
+            for call in tool_calls:
+                name = str(call.get("name") or "")
+                call_id = str(call.get("call_id") or "")
+                args = call.get("arguments") if "arguments" in call else call.get("args") or {}
+                lines.append(f"[tool_call:{name}] call_id={call_id} {json.dumps(args, sort_keys=True)}")
+        return lines
 
-    def _assemble_prompt(self, rendered):
-        # 顺序是刻意设计的：稳定规则放前面，最新请求放最后。
-        return "\n\n".join(
+    def _dynamic_tail_text(self):
+        """checkpoint / compaction / workflow packet / 当前 git status 只能出现在稳定边界之后。"""
+        parts = []
+        if hasattr(self.agent, "render_checkpoint_text"):
+            checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
+            if checkpoint_text:
+                parts.append(checkpoint_text)
+        if hasattr(self.agent, "render_compaction_text"):
+            compaction_text = str(self.agent.render_compaction_text() or "").strip()
+            if compaction_text:
+                parts.append(compaction_text)
+        if hasattr(self.agent, "render_workflow_prompt_context"):
+            workflow_prompt_context = str(self.agent.render_workflow_prompt_context() or "").strip()
+            if workflow_prompt_context:
+                parts.append("Workflow task packet:\n" + workflow_prompt_context)
+        if hasattr(self.agent, "render_live_workspace_tail"):
+            live_status = str(self.agent.render_live_workspace_tail() or "").strip()
+            if live_status:
+                parts.append(live_status)
+        return "\n\n".join(parts)
+
+    def _assemble_prompt(self, rendered, dynamic_text="", include_dynamic=True):
+        # 顺序是刻意设计的：P0/P1 稳定区最前，动态状态只向后追加，最新请求放最后。
+        # 预算收缩按不含动态尾部的骨架计算，避免 checkpoint/status 把 relevant_memory 额外压扁。
+        chunks = [rendered["prefix"].rendered]
+        if include_dynamic:
+            chunks.append(STABLE_BOUNDARY)
+            dynamic_text = str(dynamic_text or "").strip()
+            if dynamic_text:
+                chunks.append(dynamic_text)
+        chunks.extend(
             [
-                rendered["prefix"].rendered,
                 rendered["memory"].rendered,
                 rendered["relevant_memory"].rendered,
                 rendered["history"].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
             ]
-        ).strip()
+        )
+        return "\n\n".join(chunks).strip()
 
-    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
+    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts, dynamic_text=""):
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -474,7 +556,7 @@ class ContextManager:
             "budget_chars": None,
             "rendered_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
         }
-        return {
+        metadata = {
             "prompt_chars": len(prompt),
             "prompt_budget_chars": self.total_budget,
             "prompt_over_budget": len(prompt) > self.total_budget,
@@ -507,11 +589,52 @@ class ContextManager:
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+                "open_groups_preserved": int(rendered["history"].details.get("open_groups_preserved", 0)),
             },
             "current_request": {
                 "text": user_message,
                 "raw_chars": len(user_message),
                 "rendered_chars": len(user_message),
                 "section_chars": len(rendered[CURRENT_REQUEST_SECTION].rendered),
+                "truncated": False,
             },
+            "stable_boundary": STABLE_BOUNDARY,
+            "p0_hash": str(getattr(getattr(self.agent, "prefix_state", None), "p0_hash", "") or ""),
+            "p1_hash": str(getattr(getattr(self.agent, "prefix_state", None), "p1_hash", "") or ""),
+            "dynamic_chars": len(str(dynamic_text or "")),
+            "dynamic_after_boundary": True,
+        }
+        metadata.update(self._token_admission_metadata(prompt, user_message, metadata))
+        return metadata
+
+    def _token_admission_metadata(self, prompt, user_message, metadata):
+        session = getattr(self.agent, "session", {}) or {}
+        state = dict(session.get("compaction") or {}) if isinstance(session, dict) else {}
+        history = list(session.get("history", []) or []) if isinstance(session, dict) else []
+        remaining = remaining_rounds_heuristic(self.agent)
+        prefix = str(getattr(self.agent, "prefix", "") or "")
+        admission = evaluate_admission(
+            prompt_text=prompt,
+            prefix_text=prefix,
+            user_message=user_message,
+            history=history,
+            remaining_rounds=remaining,
+            window_w=self.token_window_w,
+            input_cap_i=self.token_input_cap,
+            reserved_r=self.token_reserved,
+            margin_m=self.token_margin,
+            soft_ratio=self.token_soft_ratio,
+            context_epoch=int(state.get("context_epoch") or 1),
+            last_compaction_epoch=int(state.get("last_compaction_epoch") or 0),
+        )
+        payload = admission.to_dict()
+        estimated = int(admission.estimated_input_tokens)
+        return {
+            "estimated_input_tokens": estimated,
+            "estimated_input_tokens_source": TOKEN_ESTIMATE_SOURCE,
+            "token_estimate_calibrated": False,
+            "token_admission": payload,
+            "admission_code": admission.code,
+            "admission_message": admission.message,
+            "admission_reasons": list(admission.reasons),
         }

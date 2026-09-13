@@ -285,12 +285,66 @@ def _parse_pytest_summary(text):
     raise ValueError("log_run requires parseable pytest output with a terminal summary line")
 
 
-def _parse_pytest_status(summary):
-    if "failed" in summary or "error" in summary:
+PYTEST_COLLECTED_PATTERN = re.compile(r"^collected\s+(?P<count>\d+)\s+items?", re.MULTILINE)
+PYTEST_NO_TESTS_RAN_PATTERN = re.compile(r"no tests ran in\s+\d", re.IGNORECASE)
+PYTEST_COUNT_LABELS = ("passed", "failed", "skipped", "error", "errors", "xfailed", "xpassed", "deselected")
+
+
+def _pytest_summary_counts(summary):
+    counts = {}
+    for count, label in re.findall(r"(\d+)\s+([A-Za-z]+)", str(summary or "")):
+        counts[label.lower()] = int(count)
+    return counts
+
+
+def _collected_from_counts(counts):
+    return sum(int(counts.get(label, 0) or 0) for label in PYTEST_COUNT_LABELS)
+
+
+def _parse_collected_count(text):
+    match = PYTEST_COLLECTED_PATTERN.search(str(text or ""))
+    if match:
+        return int(match.group("count"))
+    return None
+
+
+def _pytest_status_from_counts(counts, collected_count):
+    failed = int(counts.get("failed", 0) or 0) + int(counts.get("error", 0) or 0) + int(counts.get("errors", 0) or 0)
+    if failed:
         return "failed"
-    if "passed" in summary:
+    passed = int(counts.get("passed", 0) or 0)
+    if collected_count == 0 or passed <= 0:
+        return "inconclusive"
+    return "passed"
+
+
+def _parse_pytest_status(summary):
+    counts = _pytest_summary_counts(summary)
+    if counts.get("failed") or counts.get("error") or counts.get("errors"):
+        return "failed"
+    if int(counts.get("passed", 0) or 0) > 0:
         return "passed"
     raise ValueError(f"log_run could not derive pytest status from summary: {summary!r}")
+
+
+def _zero_collection_payload(command, *, cwd, result, raw_log_path, collected_count, parsed_summary, started_at, finished_at):
+    return {
+        "command": list(command),
+        "cwd": str(cwd or ""),
+        "returncode": result.returncode,
+        "exit_code": result.returncode,
+        "status": "inconclusive",
+        "parse_status": "parsed",
+        "parsed_summary": parsed_summary,
+        "collected_count": int(collected_count or 0),
+        "passed_count": 0,
+        "failed_count": 0,
+        "raw_log_path": str(raw_log_path),
+        "failure_count": 0,
+        "failures": [],
+        "started_at": started_at,
+        "finished_at": finished_at,
+    }
 
 
 def _pytest_failures(text):
@@ -359,15 +413,19 @@ def _pytest_failures(text):
     return parsed
 
 
-def _unparsed_log_payload(command, *, cwd, result, raw_log_path, parse_error=""):
+def _unparsed_log_payload(command, *, cwd, result, raw_log_path, parse_error="", started_at="", finished_at=""):
     payload = {
         "command": list(command),
         "cwd": str(cwd or ""),
         "returncode": result.returncode,
+        "exit_code": result.returncode,
         "status": "unparsed",
+        "parse_status": "unparsed",
         "raw_log_path": str(raw_log_path),
         "failure_count": 0,
         "failures": [],
+        "started_at": started_at,
+        "finished_at": finished_at,
     }
     parse_error = str(parse_error or "").strip()
     if parse_error:
@@ -375,38 +433,96 @@ def _unparsed_log_payload(command, *, cwd, result, raw_log_path, parse_error="")
     return payload
 
 
-def log_run(evidence_store, command, cwd=None, timeout=60, env=None):
+def _attach_artifact(payload, output, artifact_store, run_id=None):
+    if artifact_store is None:
+        return payload
+    from .tool_result import persist_ready_text
+
+    record = persist_ready_text(
+        artifact_store,
+        output,
+        media_type="text/plain",
+        run_id=run_id,
+    )
+    payload["artifact_id"] = record["id"]
+    payload["artifact_sha256"] = record["hash"]
+    payload["artifact_size"] = record["size"]
+    return payload
+
+
+def log_run(evidence_store, command, cwd=None, timeout=60, env=None, artifact_store=None, run_id=None):
+    started_at = _utc_now()
     result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
+    finished_at = _utc_now()
     output = (result.stdout or "") + (result.stderr or "")
     raw_log_path = evidence_store.write_raw_log(output)
     if not _is_pytest_command(command):
-        payload = _unparsed_log_payload(command, cwd=cwd, result=result, raw_log_path=raw_log_path)
+        payload = _unparsed_log_payload(
+            command,
+            cwd=cwd,
+            result=result,
+            raw_log_path=raw_log_path,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+        payload = _attach_artifact(payload, output, artifact_store, run_id=run_id)
         return evidence_store.add("log", payload, raw=True)
+    collected_count = _parse_collected_count(output)
+    no_tests_ran = bool(PYTEST_NO_TESTS_RAN_PATTERN.search(output))
     try:
         parsed_summary = _parse_pytest_summary(output)
-        status = _parse_pytest_status(parsed_summary)
+        counts = _pytest_summary_counts(parsed_summary)
+        if collected_count is None:
+            collected_count = _collected_from_counts(counts)
+        status = _pytest_status_from_counts(counts, collected_count)
         failures = _pytest_failures(output)
         if status == "failed" and not failures:
             raise ValueError("log_run could not parse pytest failure details from failing output")
+        passed_count = int(counts.get("passed", 0) or 0)
+        failed_count = int(counts.get("failed", 0) or 0) + int(counts.get("error", 0) or 0) + int(counts.get("errors", 0) or 0)
     except ValueError as exc:
+        if no_tests_ran or collected_count == 0:
+            payload = _zero_collection_payload(
+                command,
+                cwd=cwd,
+                result=result,
+                raw_log_path=raw_log_path,
+                collected_count=0 if collected_count is None else collected_count,
+                parsed_summary="no tests ran" if no_tests_ran else f"collected {0 if collected_count is None else collected_count} items",
+                started_at=started_at,
+                finished_at=finished_at,
+            )
+            payload = _attach_artifact(payload, output, artifact_store, run_id=run_id)
+            return evidence_store.add("log", payload, raw=True)
         payload = _unparsed_log_payload(
             command,
             cwd=cwd,
             result=result,
             raw_log_path=raw_log_path,
             parse_error=str(exc),
+            started_at=started_at,
+            finished_at=finished_at,
         )
+        payload = _attach_artifact(payload, output, artifact_store, run_id=run_id)
         return evidence_store.add("log", payload, raw=True)
     payload = {
         "command": list(command),
         "cwd": str(cwd or ""),
         "returncode": result.returncode,
+        "exit_code": result.returncode,
         "status": status,
+        "parse_status": "parsed",
         "parsed_summary": parsed_summary,
+        "collected_count": collected_count,
+        "passed_count": passed_count,
+        "failed_count": failed_count,
         "raw_log_path": str(raw_log_path),
         "failure_count": len(failures),
         "failures": failures,
+        "started_at": started_at,
+        "finished_at": finished_at,
     }
+    payload = _attach_artifact(payload, output, artifact_store, run_id=run_id)
     return evidence_store.add("log", payload, raw=True)
 
 

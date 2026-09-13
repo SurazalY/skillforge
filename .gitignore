@@ -28,8 +28,9 @@ htmlcov/
 *.swo
 *~
 
-# Local scratch space
-tmp/
+# Local runtime and isolation artifacts
+.skillforge/
+.tmp_*
 .worktrees/
 .pico/
 artifacts/

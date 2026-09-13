@@ -1,8 +1,8 @@
 """模型后端适配层。
 
-runtime 只关心一件事：给我一个 prompt，我拿回一段文本。
-不同 provider 在 HTTP 接口、响应结构、是否支持 prompt cache 上都有差异，
-这些差异都在这里被抹平成统一的 complete() 接口。
+runtime 通过 complete() 拿文本（兼容旧测试），正式合同是 complete_response()
+返回的不可变 ModelResponse。OpenAI 路径继续走 /v1/responses，不与
+chat/completions 混发。
 """
 
 import json
@@ -11,23 +11,56 @@ from http.client import RemoteDisconnected
 import urllib.error
 import urllib.request
 
+from .model_protocol import (
+    OPTIONAL_OPENAI_PAYLOAD_KEYS,
+    IncompleteToolCallError,
+    ModelResponse,
+    ProtocolCapabilityError,
+    ToolCallStreamAssembler,
+    assert_responses_payload,
+    build_openai_input,
+    host_supports_previous_response_id,
+    model_response_from_mapping,
+    model_response_from_openai,
+    model_response_from_text,
+    usage_from_raw,
+)
+
 OPENAI_COMPATIBLE_USER_AGENT = "skillforge/0.1"
 
 
 class FakeModelClient:
-    def __init__(self, outputs):
+    def __init__(self, outputs, xml_tool_compat=True):
         self.outputs = list(outputs)
         self.prompts = []
+        self.requests = []
         self.supports_prompt_cache = False
+        self.xml_tool_compat = bool(xml_tool_compat)
+        self.supports_native_tools = not self.xml_tool_compat
         self.last_completion_metadata = {}
+        self.last_model_response = None
+        self.last_request = None
 
     def complete(self, prompt, max_new_tokens, **kwargs):
+        return self.complete_response(prompt, max_new_tokens, **kwargs).text
+
+    def complete_response(self, prompt, max_new_tokens, **kwargs):
         self.prompts.append(prompt)
-        if not getattr(self, "last_completion_metadata", None):
-            self.last_completion_metadata = {}
+        self.last_request = {"prompt": prompt, "max_new_tokens": max_new_tokens, **kwargs}
+        self.requests.append(self.last_request)
         if not self.outputs:
             raise RuntimeError("fake model ran out of outputs")
-        return self.outputs.pop(0)
+        output = self.outputs.pop(0)
+        if isinstance(output, ModelResponse):
+            response = output
+        elif isinstance(output, dict):
+            response = model_response_from_mapping(output)
+        else:
+            response = model_response_from_text(output)
+        self.last_model_response = response
+        if not getattr(self, "last_completion_metadata", None):
+            self.last_completion_metadata = _legacy_usage_metadata(response.usage)
+        return response
 
 
 class OllamaModelClient:
@@ -38,7 +71,10 @@ class OllamaModelClient:
         self.top_p = top_p
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.xml_tool_compat = True
+        self.supports_native_tools = False
         self.last_completion_metadata = {}
+        self.last_model_response = None
 
     def complete(self, prompt, max_new_tokens, **kwargs):
         # Ollama 当前不支持我们这里接入的 prompt cache 语义，
@@ -78,7 +114,9 @@ class OllamaModelClient:
 
         if data.get("error"):
             raise RuntimeError(f"Ollama error: {data['error']}")
-        return data.get("response", "")
+        text = data.get("response", "")
+        self.last_model_response = model_response_from_text(text)
+        return text
 
 
 def _normalize_versioned_base_url(base_url):
@@ -115,100 +153,9 @@ def _extract_openai_text(data):
     return ""
 
 
-def _extract_openai_text_from_sse(body_text):
-    last_response = None
-    deltas = []
-    for line in body_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-            continue
-        if event_type == "response.output_text.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                return text
-        part = event.get("part")
-        if isinstance(part, dict):
-            text = part.get("text")
-            if isinstance(text, str) and text:
-                return text
-        item = event.get("item")
-        if isinstance(item, dict):
-            text = _extract_openai_text({"output": [item]})
-            if text:
-                return text
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            text = _extract_openai_text(response)
-            if text:
-                return text
-        text = _extract_openai_text(event)
-        if text:
-            return text
-    if deltas:
-        return "".join(deltas)
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response)
-    return ""
-
-
-def _extract_openai_response_from_sse(body_text):
-    last_response = None
-    deltas = []
-    for line in body_text.splitlines():
-        line = line.strip()
-        if not line.startswith("data:"):
-            continue
-        payload = line[len("data:"):].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            event = json.loads(payload)
-        except json.JSONDecodeError:
-            continue
-        response = event.get("response")
-        if isinstance(response, dict):
-            last_response = response
-            if event.get("type") == "response.completed":
-                text = _extract_openai_text(response)
-                if text:
-                    return text, response
-        event_type = event.get("type", "")
-        if event_type == "response.output_text.delta":
-            delta = event.get("delta")
-            if isinstance(delta, str):
-                deltas.append(delta)
-        elif event_type == "response.output_text.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                return text, last_response or {}
-        else:
-            text = _extract_openai_text(event)
-            if text:
-                return text, event
-    if deltas:
-        return "".join(deltas), last_response or {}
-    if isinstance(last_response, dict):
-        return _extract_openai_text(last_response), last_response
-    return "", {}
-
-
 def _extract_usage_cache_details(data):
-    # 把不同 OpenAI-compatible 返回里的 usage 字段整理成统一结构，
-    # 让 runtime/trace/report 不需要关心 provider 细节。
+    # 旧诊断视图：缺 cached 时仍写成 0/false。正式 usage 在 ModelResponse.usage，
+    # 缺字段保持 None，由 B-06 再显示 unknown。
     usage = data.get("usage") or {}
     input_tokens = usage.get("input_tokens", usage.get("prompt_tokens"))
     output_tokens = usage.get("output_tokens", usage.get("completion_tokens"))
@@ -223,6 +170,65 @@ def _extract_usage_cache_details(data):
     }
 
 
+def _legacy_usage_metadata(usage):
+    usage = usage_from_raw(usage)
+    raw = dict(usage.raw_usage or {})
+    cached = usage.cache_read
+    return {
+        "input_tokens": usage.input,
+        "output_tokens": usage.output,
+        "total_tokens": raw.get("total_tokens"),
+        "cached_tokens": int(cached or 0),
+        "cache_hit": bool(cached and cached > 0),
+    }
+
+
+def _iter_sse_events(body_text):
+    for line in body_text.splitlines():
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            yield json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+
+def _collect_openai_sse(body_text):
+    last_response = None
+    deltas = []
+    assembler = ToolCallStreamAssembler()
+    for event in _iter_sse_events(body_text):
+        assembler.ingest_event(event)
+        response = event.get("response")
+        if isinstance(response, dict):
+            last_response = response
+        event_type = event.get("type", "")
+        if event_type == "response.output_text.delta":
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                deltas.append(delta)
+        elif event_type == "response.output_text.done":
+            text = event.get("text")
+            if isinstance(text, str) and text:
+                return text, last_response or {}, assembler
+        elif event_type == "response.completed" and isinstance(response, dict):
+            text = _extract_openai_text(response)
+            return text, response, assembler
+        else:
+            text = _extract_openai_text(event)
+            if text and not last_response:
+                last_response = event if isinstance(event, dict) else last_response
+    if deltas:
+        return "".join(deltas), last_response or {}, assembler
+    if isinstance(last_response, dict):
+        return _extract_openai_text(last_response), last_response, assembler
+    return "", {}, assembler
+
+
 class OpenAICompatibleModelClient:
     def __init__(self, model, base_url, api_key, temperature, timeout):
         self.model = model
@@ -233,50 +239,84 @@ class OpenAICompatibleModelClient:
         # 当前只在明确支持 prompt cache 语义的后端上启用这条链路，
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
+        # previous_response_id 仅对已知支持的后端作为可选能力；当前获准 host
+        #（codexapis.com）默认不发，改走 input 内 function_call + function_call_output。
+        self.supports_previous_response_id = host_supports_previous_response_id(self.base_url)
+        # 加密 reasoning echo 与 previous_response_id 同属有状态续接；本 host 默认不回放。
+        self.supports_echo_items = self.supports_previous_response_id
+        self.supports_native_tools = True
+        self.xml_tool_compat = False
         self.last_completion_metadata = {}
+        self.last_model_response = None
+        self.last_request_payload = None
+        self.disabled_optional_capabilities = []
+        self.last_protocol_error = None
+        self._continuation_parts = {}
 
-    def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
-        """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
+    def complete(
+        self,
+        prompt,
+        max_new_tokens,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+        tools=None,
+        provider_state_ref=None,
+        tool_results=None,
+    ):
+        return self.complete_response(
+            prompt,
+            max_new_tokens,
+            prompt_cache_key=prompt_cache_key,
+            prompt_cache_retention=prompt_cache_retention,
+            tools=tools,
+            provider_state_ref=provider_state_ref,
+            tool_results=tool_results,
+        ).text
 
-        为什么存在：
-        runtime 不应该知道 HTTP 细节、SSE 细节、usage 字段长什么样，
-        更不应该自己去判断 prompt cache 参数要不要带。这个函数把这些后端
-        细节都包起来，对上层暴露统一的 `complete()` 行为。
-
-        输入 / 输出：
-        - 输入：完整 prompt、最大输出 token，以及可选的 prompt cache 参数
-        - 输出：模型最终文本；同时把 usage / cached_tokens 等元数据写进
-          `self.last_completion_metadata`
-
-        在 agent 链路里的位置：
-        它位于 `SkillForge.ask()` 的模型调用阶段，是稳定前缀缓存复用链路真正
-        落到 provider API 的地方。
-        """
+    def complete_response(
+        self,
+        prompt,
+        max_new_tokens,
+        prompt_cache_key=None,
+        prompt_cache_retention=None,
+        tools=None,
+        provider_state_ref=None,
+        tool_results=None,
+    ):
+        """向 OpenAI-compatible `/responses` 发起一次调用，返回不可变 ModelResponse。"""
         self.last_completion_metadata = {}
+        self.last_protocol_error = None
+        ref = dict(provider_state_ref or {})
+        send_previous = self._should_send_previous_response_id(ref)
+        include_echo = (not send_previous) and bool(getattr(self, "supports_echo_items", False))
+        self._continuation_parts = {
+            "prompt": prompt,
+            "provider_state_ref": ref,
+            "tool_results": list(tool_results or ()),
+        }
         payload = {
             "model": self.model,
-            "input": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": prompt,
-                        }
-                    ],
-                }
-            ],
+            "input": build_openai_input(
+                prompt,
+                ref,
+                tool_results,
+                send_previous_response_id=send_previous,
+                include_echo_items=include_echo,
+            ),
             "max_output_tokens": max_new_tokens,
             "stream": False,
         }
         if self.temperature is not None:
             payload["temperature"] = self.temperature
-        # runtime 传入的是“稳定前缀”的签名，而不是整段 prompt 的签名。
-        # 这样缓存复用针对的是稳定段，不会因为动态 history 每轮变化而失效。
         if self.supports_prompt_cache and prompt_cache_key:
             payload["prompt_cache_key"] = prompt_cache_key
         if self.supports_prompt_cache and prompt_cache_retention:
             payload["prompt_cache_retention"] = prompt_cache_retention
+        if tools:
+            payload["tools"] = list(tools)
+        if send_previous:
+            payload["previous_response_id"] = ref["previous_response_id"]
+        assert_responses_payload(payload)
 
         headers = {
             "Content-Type": "application/json",
@@ -286,68 +326,140 @@ class OpenAICompatibleModelClient:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
-        request = urllib.request.Request(
-            self.base_url + "/responses",
-            data=json.dumps(payload).encode("utf-8"),
-            headers=headers,
-            method="POST",
+        body_text, content_type = self._post_responses(payload)
+        self.last_request_payload = payload
+        model_response = self._parse_responses_body(body_text, content_type)
+        self.last_model_response = model_response
+        usage_data = dict(model_response.usage.raw_usage or {})
+        self.last_completion_metadata = {
+            "prompt_cache_supported": self.supports_prompt_cache,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+            **_extract_usage_cache_details({"usage": usage_data} if usage_data else {}),
+        }
+        if not model_response.text and not model_response.tool_calls:
+            raise RuntimeError("OpenAI-compatible error: could not extract text or tool calls from response")
+        return model_response
+
+    def _should_send_previous_response_id(self, ref):
+        if "previous_response_id" in (self.disabled_optional_capabilities or ()):
+            return False
+        if not getattr(self, "supports_previous_response_id", False):
+            return False
+        return bool(ref.get("previous_response_id"))
+
+    def _rebuild_stateless_payload(self, payload):
+        payload.pop("previous_response_id", None)
+        parts = self._continuation_parts or {}
+        payload["input"] = build_openai_input(
+            parts.get("prompt"),
+            parts.get("provider_state_ref"),
+            parts.get("tool_results"),
+            send_previous_response_id=False,
+            include_echo_items=bool(getattr(self, "supports_echo_items", False)),
         )
+        extras = list(self.disabled_optional_capabilities or [])
+        if "previous_response_id" not in extras:
+            extras.append("previous_response_id")
+        self.disabled_optional_capabilities = extras
+        self.supports_previous_response_id = False
+        return payload
+
+    def _post_responses(self, payload):
         attempts = 3
+        optional_retry_used = False
+        previous_id_retry_used = False
+        last_error = None
         for attempt in range(attempts):
+            request = urllib.request.Request(
+                self.base_url + "/responses",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
+                    **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
+                },
+                method="POST",
+            )
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     body_text = response.read().decode("utf-8")
                     headers = getattr(response, "headers", {}) or {}
                     content_type = headers.get("Content-Type", "")
-                break
+                self.last_request_payload = payload
+                return body_text, content_type
             except urllib.error.HTTPError as exc:
                 body = exc.read().decode("utf-8", errors="replace")
+                last_error = RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}")
+                if exc.code == 400:
+                    self.last_protocol_error = {"http_status": 400, "body": body, "payload_keys": sorted(payload)}
+                    disabled = [
+                        key for key in OPTIONAL_OPENAI_PAYLOAD_KEYS if key in payload
+                    ]
+                    if disabled and not optional_retry_used:
+                        for key in disabled:
+                            payload.pop(key, None)
+                        self.disabled_optional_capabilities = list(disabled)
+                        optional_retry_used = True
+                        continue
+                    if (
+                        "previous_response_id" in payload
+                        and "previous_response_id" in body
+                        and not previous_id_retry_used
+                    ):
+                        payload = self._rebuild_stateless_payload(payload)
+                        previous_id_retry_used = True
+                        continue
+                    raise ProtocolCapabilityError(
+                        f"OpenAI-compatible protocol error HTTP 400; disabled={self.disabled_optional_capabilities}: {body}"
+                    ) from exc
                 if exc.code >= 500 and attempt < attempts - 1:
                     time.sleep(0.5 * (attempt + 1))
                     continue
-                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+                raise last_error from exc
             except (urllib.error.URLError, RemoteDisconnected) as exc:
-                if attempt < attempts - 1:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-                raise RuntimeError(
+                last_error = RuntimeError(
                     "Could not reach the OpenAI-compatible backend.\n"
                     f"Base URL: {self.base_url}\n"
                     f"Model: {self.model}"
-                ) from exc
+                )
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise last_error from exc
+        raise last_error
 
-        # 有些兼容后端返回普通 JSON，有些返回 SSE。
-        # 这里两种都接住，并尽量统一抽取文本和 usage/cache 元数据。
+    def _parse_responses_body(self, body_text, content_type):
+        assembler_calls = None
+        fallback_text = ""
+        data = {}
         if content_type.startswith("text/event-stream") or body_text.lstrip().startswith("data:"):
-            text, response_data = _extract_openai_response_from_sse(body_text)
-            if isinstance(response_data, dict) and response_data:
-                # 这些元数据会一路传回 runtime，进入 trace 和 report，
-                # 用来观察 prompt cache 是否真的命中。
-                self.last_completion_metadata = {
-                    "prompt_cache_supported": self.supports_prompt_cache,
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_retention": prompt_cache_retention,
-                    **_extract_usage_cache_details(response_data),
-                }
-            if text:
-                return text
-            raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
-
-        try:
-            data = json.loads(body_text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
-            ) from exc
+            fallback_text, data, assembler = _collect_openai_sse(body_text)
+            try:
+                assembler_calls = assembler.finalize(require_done=True)
+            except IncompleteToolCallError:
+                if not data:
+                    return ModelResponse(
+                        response_id="",
+                        text_blocks=(fallback_text,) if fallback_text else (),
+                        tool_calls=(),
+                        finish_reason="incomplete",
+                        usage=usage_from_raw({}),
+                    )
+                assembler_calls = ()
+                data = dict(data)
+                data.setdefault("status", "incomplete")
+        else:
+            try:
+                data = json.loads(body_text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "OpenAI-compatible error: backend returned non-JSON content that could not be parsed"
+                ) from exc
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
-        self.last_completion_metadata = {
-            "prompt_cache_supported": self.supports_prompt_cache,
-            "prompt_cache_key": prompt_cache_key,
-            "prompt_cache_retention": prompt_cache_retention,
-            **_extract_usage_cache_details(data),
-        }
-        return _extract_openai_text(data)
+        return model_response_from_openai(data, fallback_text=fallback_text, assembler_calls=assembler_calls)
 
 
 def _extract_anthropic_text(data):
@@ -367,7 +479,10 @@ class AnthropicCompatibleModelClient:
         self.temperature = temperature
         self.timeout = timeout
         self.supports_prompt_cache = False
+        self.xml_tool_compat = True
+        self.supports_native_tools = False
         self.last_completion_metadata = {}
+        self.last_model_response = None
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         # 为了保持统一接口，runtime 仍然会传缓存参数进来；
@@ -437,5 +552,6 @@ class AnthropicCompatibleModelClient:
             raise RuntimeError(f"Anthropic-compatible error: {data['error']}")
         text = _extract_anthropic_text(data)
         if text:
+            self.last_model_response = model_response_from_text(text)
             return text
         raise RuntimeError("Anthropic-compatible error: could not extract text from response")

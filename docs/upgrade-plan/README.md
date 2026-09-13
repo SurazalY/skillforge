@@ -1,6 +1,6 @@
 # SkillForge 升级增订与阶段实施包
 
-初版日期：2026-09-12；更新：2026-09-13。状态：A 原报告已收到，基线与 Git 检查点补充已获准；A 尚未关闭，B—E 未获准启动。
+初版日期：2026-09-12；更新：2026-09-13。状态：A 与 B 均已由用户关闭；C—E 未获准启动。
 
 本包记录用户对 2026-09-08 升级方案的微调决定，并提供开发边界、阶段追踪表及可投放到另一套 harness 的主控 Prompt。它不是实现完成报告。
 
@@ -13,8 +13,9 @@
 | [总进度表](03-progress.md) | 唯一的阶段批准、关闭和报告索引 | 用户、任务分发 Agent |
 | [阶段主控通用规则](04-controller-rules.md) | 主控边界、子任务派发、报告与跨阶段规则 | 每阶段主控 |
 | [A：基线固定](phases/A-baseline.md) | A 阶段任务表与主控 Prompt | A 主控 |
-| [A 收尾补充 Prompt](prompts/A-closeout.md) | 当前应投放给既有 A 主控的补充任务 | 用户、A 主控 |
+| [A 收尾补充 Prompt](prompts/A-closeout.md) | 已执行的收尾任务，历史记录 | 用户、A 主控 |
 | [B：执行与上下文](phases/B-runtime-context.md) | B 阶段任务表与主控 Prompt | B 主控 |
+| [B 启动主控 Prompt](prompts/B-start.md) | 当前应投放的完整 Prompt，含 A 最新交接 | 用户、B 主控 |
 | [C：可靠本地运行](phases/C-reliable-local.md) | C 阶段任务表与主控 Prompt | C 主控 |
 | [D：经验与协作](phases/D-skills-delegation.md) | D 阶段任务表与主控 Prompt | D 主控 |
 | [E：评测与终端体验](phases/E-evaluation-cli.md) | E 阶段任务表与主控 Prompt | E 主控 |

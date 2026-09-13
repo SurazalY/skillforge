@@ -19,10 +19,61 @@ from . import memory as memorylib
 from .audit import audit_code_change
 from .context_manager import ContextManager
 from .evidence import EvidenceStore
+from .prompt_manifest import (
+    build_prompt_manifest,
+    cache_capabilities_from_client,
+    make_epoch_id,
+    overlay_usage_display,
+    p1_workspace_identity,
+    render_p1_memory_snapshot,
+    render_p1_skill_catalog,
+    render_p1_workspace_text,
+    render_sorted_tool_lines,
+    tool_schema_version,
+    usage_display_from_official,
+    json_safe,
+)
+from .model_protocol import (
+    DuplicateCallIdError,
+    IncompleteToolCallError,
+    ModelResponse,
+    ToolCall,
+    ToolCallGroup,
+    executable_tool_calls,
+    export_openai_tools,
+    xml_compat_from_env,
+)
+from .compaction import (
+    INPUT_TOO_LARGE,
+    commit_candidate,
+    current_compaction,
+    generate_candidate,
+    is_compaction_id,
+    new_group_id,
+    render_summary_text,
+)
+from .authorization import (
+    AUTHORIZED_ARTIFACT_READ_TOOLS,
+    DECISION_ALLOW,
+    DECISION_ASK,
+    DECISION_DENY,
+    DECISION_NEED_TICKET,
+    AuthorizationGate,
+)
+from .patch_plan import (
+    PatchPlan,
+    StaleInputError,
+    apply_plan,
+    file_content_hash,
+)
 from .run_store import RunStore
+from .store import ToolCallConflict, open_state_store
+from .task_contract import TaskContract
 from .skills import SkillDistiller, SkillStore
+from .verification import build_verification_record, should_record_verification
 from .task_state import STOP_REASON_AUDIT_FAILED, STOP_REASON_COMPLETION_GATE_BLOCKED, STOP_REASON_SKILL_DISTILL_FAILED, TaskState
 from . import tools as toolkit
+from . import tool_result as toolresult
 from .workflow import (
     CompletionGate,
     HandoffArtifact,
@@ -43,6 +94,7 @@ DEFAULT_FEATURE_FLAGS = {
     "relevant_memory": True,
     "context_reduction": True,
     "prompt_cache": True,
+    "xml_tool_compat": False,
 }
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
@@ -70,32 +122,48 @@ EVIDENCE_ID_PATTERN = re.compile(r"^evidence_id:\s*(\S+)\s*$", re.MULTILINE)
 class PromptPrefix:
     # prefix 除了文本本身，还带一小份元数据，
     # 这样 runtime 才能明确判断 prefix 是否可以复用。
+    # P0/P1 是同 epoch 稳定区；checkpoint / 阶段 / git status 不进入这段文本。
     text: str
     hash: str
     workspace_fingerprint: str
     tool_signature: str
     built_at: str
+    p0_text: str = ""
+    p1_text: str = ""
+    p0_hash: str = ""
+    p1_hash: str = ""
+    p1_identity: str = ""
+    tool_schema_version: str = ""
+    skill_catalog_version: str = ""
+    epoch_id: str = ""
+    invalidation_reason: str = "epoch_start"
 
 
 class SessionStore:
     def __init__(self, root):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._store = open_state_store(self.root)
 
     def path(self, session_id):
         return self.root / f"{session_id}.json"
 
     def save(self, session):
-        path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2), encoding="utf-8")
-        return path
+        # 可写事实源是 SQLite。旧 JSON 路径仅用于只读导入，不再回写。
+        return self._store.upsert_session(session)
 
     def load(self, session_id):
-        return json.loads(self.path(session_id).read_text(encoding="utf-8"))
+        payload = self._store.load_session(session_id)
+        if payload is not None:
+            return payload
+        legacy = self.path(session_id)
+        if legacy.is_file():
+            return self._store.import_legacy_session_file(legacy)
+        raise FileNotFoundError(str(legacy))
 
     def latest(self):
-        files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
-        return files[-1].stem if files else None
+        self._store.import_legacy_sessions_dir(self.root)
+        return self._store.latest_session_id()
 
 
 class SkillForge:
@@ -165,15 +233,24 @@ class SkillForge:
         )
         self.session["memory"] = self.memory.to_dict()
         self.tools = self.build_tools()
+        self.task_contract = TaskContract.default_workspace()
+        self.authz = AuthorizationGate(self)
+        self.patch_plans = {}
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
         self.resume_state = self.evaluate_resume_state()
         self.session_path = self.session_store.save(self.session)
+        if hasattr(self.run_store, "bind_session"):
+            self.run_store.bind_session(self.session["id"], workspace_root=self.workspace.repo_root)
         self.current_task_state = None
         self.current_run_dir = None
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
+        self.last_model_response = None
+        self._provider_state_ref = None
+        self._pending_native_tool_results = []
+        self._last_native_tools_sent = False
         self.last_durable_promotions = []
         self.last_durable_rejections = []
         self.last_durable_superseded = []
@@ -181,6 +258,8 @@ class SkillForge:
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
+            "p1_identity_changed": False,
+            "invalidation_reason": "epoch_start",
         }
         self._used_active_skill_ids = set()
 
@@ -328,6 +407,47 @@ class SkillForge:
             lines.append(f"- Summary: {summary}")
         return "\n".join(lines)
 
+    def render_compaction_text(self):
+        checkpoint = current_compaction(self.session)
+        if not checkpoint:
+            return ""
+        return render_summary_text(checkpoint)
+
+    def current_compaction_checkpoint(self):
+        return current_compaction(self.session)
+
+    def submit_compaction_checkpoint(self, candidate=None, extra_required_ids=None):
+        """结构化摘要提交。失败保留旧视图，不改 resume `ckpt_*`。"""
+        history = list(self.session.get("history", []) or [])
+        prefix_state = getattr(self, "prefix_state", None)
+        epoch_id = str(getattr(prefix_state, "epoch_id", "") or "")
+        if candidate is None:
+            candidate = generate_candidate(
+                history=history,
+                contract=self.task_contract,
+                extra_required_ids=extra_required_ids,
+                epoch_id=epoch_id,
+                context_epoch=int((self.session.get("compaction") or {}).get("context_epoch") or 1),
+            )
+        if candidate is None:
+            return {"ok": False, "reason": "no closed group boundary to freeze", "checkpoint": None, "validation": None}
+        previous = current_compaction(self.session)
+        previous_state = dict(self.session.get("compaction") or {})
+        result = commit_candidate(agent=self, candidate=candidate)
+        if not result.ok:
+            if previous_state:
+                self.session["compaction"] = previous_state
+            elif previous is None:
+                self.session["compaction"] = {"current_id": "", "items": {}, "context_epoch": int((previous_state or {}).get("context_epoch") or 1), "last_compaction_epoch": 0}
+            return result.to_dict()
+        resume_current = str((self.session.get("checkpoints") or {}).get("current_id") or "")
+        if is_compaction_id(resume_current):
+            raise RuntimeError("compaction id must not replace resume checkpoint current_id")
+        task_state = getattr(self, "current_task_state", None)
+        if task_state is not None and is_compaction_id(str(getattr(task_state, "checkpoint_id", "") or "")):
+            raise RuntimeError("compaction id must not replace task_state.checkpoint_id")
+        return result.to_dict()
+
     @staticmethod
     def remember(bucket, item, limit):
         if not item:
@@ -346,6 +466,20 @@ class SkillForge:
     def prompt_tool_signature(self):
         return self._tool_signature_for_names(self.prompt_tool_names())
 
+    def epoch_tool_names(self):
+        """会话可见的稳定工具目录：不随阶段过滤，但不超过工作流/委派授权。"""
+        names = tuple(self.tools)
+        if self.delegated_tool_whitelist:
+            whitelist = set(self.delegated_tool_whitelist)
+            names = tuple(name for name in names if name in whitelist)
+        elif self.workflow is not None:
+            allowed = set(self.workflow.allowed_tools)
+            names = tuple(name for name in names if name in allowed)
+        return tuple(sorted(names))
+
+    def epoch_tool_signature(self):
+        return self._tool_signature_for_names(self.epoch_tool_names())
+
     def _tool_signature_for_names(self, names):
         payload = []
         for name in sorted(names):
@@ -359,6 +493,39 @@ class SkillForge:
                 }
             )
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+
+    def xml_tool_compat_enabled(self):
+        default = bool(self.feature_flags.get("xml_tool_compat")) or bool(
+            getattr(self.model_client, "xml_tool_compat", False)
+        )
+        return xml_compat_from_env(default=default)
+
+    def _persistence_store(self):
+        store = getattr(self.run_store, "_store", None)
+        if store is not None and hasattr(store, "remember_tool_call"):
+            return store
+        store = getattr(self.session_store, "_store", None)
+        if store is not None and hasattr(store, "remember_tool_call"):
+            return store
+        return None
+
+    def artifact_store(self):
+        """Existing Session/Run SQLite store. Tools must not open a third connection."""
+        return self._persistence_store()
+
+    def _remember_tool_call(self, call, result):
+        store = self._persistence_store()
+        if store is None:
+            return None
+        run_id = getattr(self.current_task_state, "run_id", None)
+        return store.remember_tool_call(
+            call.call_id,
+            dict(call.arguments),
+            name=call.name,
+            run_id=run_id,
+            result=result,
+            state="completed",
+        )
 
     def prompt_tool_names(self):
         if not self.workflow or not self.workflow_kernel:
@@ -377,32 +544,43 @@ class SkillForge:
             return tuple(self.tools)
         return tuple(name for name in _phase_allowed_tools(self.workflow, self.workflow_kernel.state.phase) if name in self.tools)
 
-    def build_prefix(self):
-        tool_lines = []
-        for name in self.prompt_tool_names():
-            tool = self.tools[name]
-            fields = ", ".join(f"{key}: {value}" for key, value in tool["schema"].items())
-            risk = "approval required" if tool["risky"] else "safe"
-            tool_lines.append(f"- {name}({fields}) [{risk}] {tool['description']}")
-        tool_text = "\n".join(tool_lines)
-        examples = "\n".join(
-            [toolkit.tool_example(name) for name in self.prompt_tool_names() if toolkit.tool_example(name)] + ["<final>Done.</final>"]
-        )
-        # prefix 可以理解成 agent 的“工作手册”：
-        # 它是谁、工具怎么调用、当前仓库是什么状态，都写在这里。
-        text = textwrap.dedent(
+    def build_prefix(self, invalidation_reason="epoch_start"):
+        names = self.epoch_tool_names()
+        tool_text = render_sorted_tool_lines(self.tools, names)
+        schema_version = tool_schema_version(self.tools, names)
+        if self.xml_tool_compat_enabled():
+            examples = "\n".join(
+                [toolkit.tool_example(name) for name in names if toolkit.tool_example(name)] + ["<final>Done.</final>"]
+            )
+            protocol_rules = textwrap.dedent(
+                """\
+                - Return exactly one <tool>...</tool> or one <final>...</final>.
+                - Tool calls must look like:
+                  <tool>{{"name":"tool_name","args":{{...}}}}</tool>
+                - For write_file and patch_file with multi-line text, prefer XML style:
+                  <tool name="write_file" path="file.py"><content>...</content></tool>
+                - Final answers must look like:
+                  <final>your answer</final>
+                """
+            ).strip()
+            examples_header = "Valid response examples:"
+        else:
+            examples = "Native function tools are supplied in the request. Do not emit XML tool or final tags."
+            protocol_rules = textwrap.dedent(
+                """\
+                - Use the native function-calling interface for tools.
+                - Do not emit XML tool or final tags.
+                - When finished, reply with a concise plain-text answer.
+                """
+            ).strip()
+            examples_header = "Protocol:"
+        p0_text = textwrap.dedent(
             f"""\
             You are skillforge, a small local coding agent working inside a local repository.
 
             Rules:
             - Use tools instead of guessing about the workspace.
-            - Return exactly one <tool>...</tool> or one <final>...</final>.
-            - Tool calls must look like:
-              <tool>{{"name":"tool_name","args":{{...}}}}</tool>
-            - For write_file and patch_file with multi-line text, prefer XML style:
-              <tool name="write_file" path="file.py"><content>...</content></tool>
-            - Final answers must look like:
-              <final>your answer</final>
+            {protocol_rules}
             - Never invent tool results.
             - Keep answers concise and concrete.
             - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
@@ -415,19 +593,43 @@ class SkillForge:
             Tools:
             {tool_text}
 
-            Valid response examples:
+            {examples_header}
             {examples}
-
-            {self.workspace.text()}
             """
         ).strip()
+        skill_catalog_text, skill_catalog_version = render_p1_skill_catalog(self)
+        p1_text = "\n\n".join(
+            [
+                render_p1_workspace_text(self.workspace),
+                render_p1_memory_snapshot(self),
+                skill_catalog_text,
+            ]
+        ).strip()
+        text = f"{p0_text}\n\n{p1_text}"
+        p0_hash = hashlib.sha256(p0_text.encode("utf-8")).hexdigest()
+        p1_hash = hashlib.sha256(p1_text.encode("utf-8")).hexdigest()
+        prefix_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        session_id = str((getattr(self, "session", {}) or {}).get("id", "") or "")
         return PromptPrefix(
             text=text,
-            hash=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            hash=prefix_hash,
             workspace_fingerprint=self.workspace.fingerprint(),
-            tool_signature=self.prompt_tool_signature(),
+            tool_signature=self.epoch_tool_signature(),
             built_at=now(),
+            p0_text=p0_text,
+            p1_text=p1_text,
+            p0_hash=p0_hash,
+            p1_hash=p1_hash,
+            p1_identity=p1_workspace_identity(self.workspace),
+            tool_schema_version=schema_version,
+            skill_catalog_version=skill_catalog_version,
+            epoch_id=make_epoch_id(session_id, p0_hash, p1_hash),
+            invalidation_reason=str(invalidation_reason or "epoch_start"),
         )
+
+    def render_live_workspace_tail(self):
+        status = str(getattr(self.workspace, "status", "") or "").strip() or "clean"
+        return "Live workspace status (dynamic):\n" + status
 
     def _apply_prefix_state(self, prefix_state):
         self.prefix_state = prefix_state
@@ -435,24 +637,38 @@ class SkillForge:
 
     def refresh_prefix(self, force=False):
         previous_hash = getattr(getattr(self, "prefix_state", None), "hash", None)
-        previous_workspace_fingerprint = getattr(getattr(self, "prefix_state", None), "workspace_fingerprint", None)
+        previous_p1_identity = getattr(getattr(self, "prefix_state", None), "p1_identity", None)
+        previous_tool_signature = getattr(getattr(self, "prefix_state", None), "tool_signature", None)
 
-        # 工作区事实相对稳定，所以这里按整体刷新；
-        # 只有这些事实真的变化了，才重建完整 prefix。
+        # 工作区直播对象可以更新（git status 进动态尾部）；
+        # 只有 P1 身份（不含 status）或稳定工具目录变化时才重建 P0/P1。
         refreshed_workspace = WorkspaceContext.build(self.root)
-        refreshed_workspace_fingerprint = refreshed_workspace.fingerprint()
-        workspace_changed = force or refreshed_workspace_fingerprint != previous_workspace_fingerprint
-        if workspace_changed:
-            self.workspace = refreshed_workspace
+        self.workspace = refreshed_workspace
+        current_p1_identity = p1_workspace_identity(refreshed_workspace)
+        p1_identity_changed = previous_p1_identity is None or current_p1_identity != previous_p1_identity
+        tool_schema_changed = previous_tool_signature is not None and previous_tool_signature != self.epoch_tool_signature()
+        if force:
+            invalidation_reason = "forced"
+        elif previous_hash is None or previous_p1_identity is None:
+            invalidation_reason = "epoch_start"
+        elif current_p1_identity != previous_p1_identity:
+            invalidation_reason = "p1_workspace_identity"
+        elif tool_schema_changed:
+            invalidation_reason = "tool_schema"
+        else:
+            invalidation_reason = "none"
 
-        prefix_state = self.build_prefix() if workspace_changed or force or previous_hash is None else self.prefix_state
-        prefix_changed = force or previous_hash != prefix_state.hash
-        if prefix_changed:
+        rebuild = force or previous_hash is None or p1_identity_changed or tool_schema_changed
+        prefix_state = self.build_prefix(invalidation_reason=invalidation_reason) if rebuild else self.prefix_state
+        prefix_changed = force or previous_hash != getattr(prefix_state, "hash", None)
+        if rebuild:
             self._apply_prefix_state(prefix_state)
 
         self._last_prefix_refresh = {
-            "workspace_changed": workspace_changed,
-            "prefix_changed": prefix_changed,
+            "workspace_changed": bool(p1_identity_changed and previous_p1_identity is not None),
+            "prefix_changed": bool(prefix_changed),
+            "p1_identity_changed": bool(p1_identity_changed and previous_p1_identity is not None),
+            "invalidation_reason": prefix_state.invalidation_reason if prefix_changed else "none",
         }
         return dict(self._last_prefix_refresh)
 
@@ -580,10 +796,12 @@ class SkillForge:
         force_refresh = False
         if self.workflow and self.workflow_kernel:
             task_packet = self._compile_workflow_task_packet(user_message)
-            force_refresh = getattr(getattr(self, "prefix_state", None), "tool_signature", "") != self.prompt_tool_signature()
+            force_refresh = getattr(getattr(self, "prefix_state", None), "tool_signature", "") != self.epoch_tool_signature()
         refresh = self.refresh_prefix(force=force_refresh)
         self.resume_state = self.evaluate_resume_state()
         prompt, metadata = self.context_manager.build(user_message)
+        cache_supported = bool(getattr(self.model_client, "supports_prompt_cache", False))
+        cache_key_sent = bool(cache_supported and self.prefix_state.hash)
         # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
         metadata.update(
@@ -597,16 +815,23 @@ class SkillForge:
                 "workspace_docs": len(self.workspace.project_docs),
                 "recent_commits": len(self.workspace.recent_commits),
                 "prefix_hash": self.prefix_state.hash,
+                "p0_hash": self.prefix_state.p0_hash,
+                "p1_hash": self.prefix_state.p1_hash,
                 "prompt_cache_key": self.prefix_state.hash,
                 "workspace_fingerprint": self.prefix_state.workspace_fingerprint,
                 "tool_signature": self.prefix_state.tool_signature,
+                "tool_schema_version": self.prefix_state.tool_schema_version,
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
-                "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
+                "p1_identity_changed": refresh.get("p1_identity_changed", False),
+                "invalidation_reason": refresh.get("invalidation_reason", self.prefix_state.invalidation_reason),
+                "prompt_cache_supported": cache_supported,
+                "cache_key_sent": cache_key_sent,
                 "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
                 "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
                 "stale_paths": list(self.resume_state.get("stale_paths", [])),
                 "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
+                "usage_display": usage_display_from_official(None),
             }
         )
         if task_packet is not None:
@@ -621,6 +846,15 @@ class SkillForge:
                 }
             )
         metadata.update(self.detected_secret_env_summary())
+        manifest = build_prompt_manifest(
+            agent=self,
+            prompt=prompt,
+            prefix_state=self.prefix_state,
+            metadata=metadata,
+            cache_key_sent=cache_key_sent,
+        ).to_dict()
+        metadata["prompt_manifest"] = manifest
+        metadata["cache_capabilities"] = dict(manifest.get("cache_capabilities") or cache_capabilities_from_client(self.model_client).to_dict())
         return prompt, metadata
 
     def _configure_workflow(self, workflow_name, workflow_state=None, delegated_task_packet=None):
@@ -753,21 +987,21 @@ class SkillForge:
         if not related_evidence_ids:
             return
         log_record = self.current_evidence_store().get(related_evidence_ids[-1])
-        verification_status = str(log_record.payload.get("status", "")).strip()
-        if verification_status == "unparsed":
+        if not should_record_verification(
+            phase=self.workflow_kernel.state.phase,
+            tool_name=name,
+            log_payload=log_record.payload,
+        ):
             return
-        self.record_runtime_evidence(
-            "verification",
-            {
-                "summary": str(log_record.payload.get("parsed_summary") or verification_status),
-                "status": verification_status,
-                "phase": self.workflow_kernel.state.phase,
-                "command": " ".join(str(part) for part in log_record.payload.get("command", [])),
-                "returncode": log_record.payload.get("returncode"),
-                "log_evidence_id": log_record.evidence_id,
-                "tool_evidence_id": tool_evidence_id,
-            },
+        payload = build_verification_record(
+            log_record=log_record,
+            task_contract=self.task_contract,
+            workspace_manifest=self.capture_workspace_snapshot(),
+            run_id=self.current_task_state.run_id if self.current_task_state else "",
+            call_id=str(metadata.get("replayed_call_id") or ""),
+            tool_evidence_id=tool_evidence_id,
         )
+        self.record_runtime_evidence("verification", payload)
 
     def _workflow_paths(self):
         memory = self.memory.to_dict().get("working", {})
@@ -1140,6 +1374,42 @@ class SkillForge:
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
         return final
 
+    def _input_too_large_failure(self, task_state, user_message, prompt_metadata):
+        admission = prompt_metadata.get("token_admission") or {}
+        code = str(prompt_metadata.get("admission_code") or admission.get("code") or INPUT_TOO_LARGE)
+        final = str(prompt_metadata.get("admission_message") or admission.get("message") or "").strip()
+        if code == INPUT_TOO_LARGE:
+            if "INPUT_TOO_LARGE" not in final:
+                final = (
+                    "INPUT_TOO_LARGE: shrink the request or attach large material as an artifact "
+                    "and read it in segments. Trailing user constraints were not silently truncated."
+                )
+        elif not final:
+            final = (
+                f"{code}: request exceeds the hard token window. "
+                "Trailing user constraints were not silently truncated."
+            )
+        current_request = (prompt_metadata.get("current_request") or {}).get("text") or user_message
+        if str(current_request) and str(current_request) not in final:
+            # 不把全文再塞进返回值以免重复膨胀；只保证 metadata 仍持有未裁剪请求。
+            pass
+        task_state.stop(code, status="failed", final_answer=final)
+        self.last_prompt_metadata = json_safe(prompt_metadata)
+        self._record_active_skill_outcome(succeeded=False)
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(
+            task_state,
+            "run_finished",
+            {
+                "status": task_state.status,
+                "stop_reason": task_state.stop_reason,
+                "final_answer": final,
+                "admission": admission,
+            },
+        )
+        self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
+        return final
+
     def _record_phase_completion_evidence(self, phase, phase_summary):
         if not self.workflow:
             return
@@ -1429,6 +1699,8 @@ class SkillForge:
         """
         run_started_at = time.monotonic()
         self.memory.set_task_summary(user_message)
+        if not self.task_contract.goal:
+            self.task_contract = self.task_contract.with_goal(user_message)
         self.record({"role": "user", "content": user_message, "created_at": now()})
         self._reset_workflow_run()
         self._used_active_skill_ids = set()
@@ -1480,6 +1752,28 @@ class SkillForge:
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
+            if prompt_metadata.get("admission_code") == INPUT_TOO_LARGE:
+                return self._input_too_large_failure(task_state, user_message, prompt_metadata)
+            admission = prompt_metadata.get("token_admission") or {}
+            if admission.get("code") == "HARD_OVERFLOW" and admission.get("may_compact"):
+                compact_result = self.submit_compaction_checkpoint()
+                prompt_metadata["compaction_attempt"] = compact_result
+                if compact_result.get("ok"):
+                    prompt, prompt_metadata = self._build_prompt_and_metadata(user_message)
+                    self.emit_trace(
+                        task_state,
+                        "prompt_built",
+                        {
+                            "prompt_metadata": prompt_metadata,
+                            "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
+                            "after_compaction": True,
+                        },
+                    )
+                    if prompt_metadata.get("admission_code") == INPUT_TOO_LARGE:
+                        return self._input_too_large_failure(task_state, user_message, prompt_metadata)
+                    admission = prompt_metadata.get("token_admission") or {}
+            if admission.get("may_send") is False:
+                return self._input_too_large_failure(task_state, user_message, prompt_metadata)
             if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
                 checkpoint = self.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
                 self.run_store.write_task_state(task_state)
@@ -1536,72 +1830,159 @@ class SkillForge:
                 prompt_cache_key = prompt_metadata.get("prompt_cache_key")
                 prompt_cache_retention = "in_memory"
             model_started_at = time.monotonic()
-            raw = self.model_client.complete(
+            complete_kwargs = {
+                "prompt_cache_key": prompt_cache_key,
+                "prompt_cache_retention": prompt_cache_retention,
+            }
+            xml_compat = self.xml_tool_compat_enabled()
+            if not xml_compat:
+                complete_kwargs["tools"] = export_openai_tools(self.tools, self.prompt_tool_names())
+                if self._provider_state_ref:
+                    complete_kwargs["provider_state_ref"] = self._provider_state_ref
+                if self._pending_native_tool_results:
+                    complete_kwargs["tool_results"] = list(self._pending_native_tool_results)
+            self._last_native_tools_sent = bool(complete_kwargs.get("tools"))
+            raw_output = self.model_client.complete(
                 prompt,
                 self.max_new_tokens,
-                prompt_cache_key=prompt_cache_key,
-                prompt_cache_retention=prompt_cache_retention,
+                **complete_kwargs,
             )
+            model_response = getattr(self.model_client, "last_model_response", None)
+            if isinstance(raw_output, ModelResponse):
+                model_response = raw_output
+            elif not isinstance(model_response, ModelResponse):
+                model_response = ModelResponse(
+                    response_id="",
+                    text_blocks=(str(raw_output),) if raw_output else (),
+                )
+            self.last_model_response = model_response
+            if model_response.provider_state_ref:
+                self._provider_state_ref = dict(model_response.provider_state_ref)
+            self._pending_native_tool_results = []
             if self.workflow and self.workflow_kernel:
                 self.workflow_kernel.record_round()
-            completion_metadata = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
-            if completion_metadata:
-                # 把后端返回的 usage/cache 统计并回 prompt_metadata，
-                # 方便统一写入 report 和 trace。
-                prompt_metadata.update(completion_metadata)
-            self.last_completion_metadata = completion_metadata
-            self.last_prompt_metadata = prompt_metadata
-            kind, payload = self.parse(raw)
+            official_usage = json_safe(model_response.usage.as_dict())
+            usage_display = usage_display_from_official(model_response.usage)
+            prompt_metadata["model_response_usage"] = official_usage
+            prompt_metadata["model_response_id"] = model_response.response_id
+            prompt_metadata["usage_display"] = usage_display
+            manifest = overlay_usage_display(prompt_metadata.get("prompt_manifest"), model_response.usage)
+            prompt_metadata["prompt_manifest"] = json_safe(manifest)
+            legacy_meta = dict(getattr(self.model_client, "last_completion_metadata", {}) or {})
+            prompt_metadata["legacy_completion_metadata"] = json_safe(legacy_meta)
+            self.last_completion_metadata = legacy_meta
+            self.last_prompt_metadata = json_safe(prompt_metadata)
+            kind, payload = self.interpret_model_response(model_response)
             self.emit_trace(
                 task_state,
                 "model_parsed",
                 {
                     "kind": kind,
-                    "completion_metadata": completion_metadata,
+                    "completion_metadata": legacy_meta,
+                    "model_response_usage": official_usage,
                     "duration_ms": int((time.monotonic() - model_started_at) * 1000),
                 },
             )
 
+            calls_to_run = None
             if kind == "tool":
-                tool_steps += 1
-                name = payload.get("name", "")
-                args = payload.get("args", {})
-                task_state.record_tool(name)
-                if self.workflow and self.workflow_kernel:
-                    self.workflow_kernel.record_tool()
-                tool_started_at = time.monotonic()
-                result = self.run_tool(name, args)
-                self._record_tool_evidence(name, args, result)
+                calls_to_run = [
+                    ToolCall(
+                        call_id=f"xml-{uuid.uuid4().hex}",
+                        name=str(payload.get("name", "")),
+                        arguments=payload.get("args") or {},
+                    )
+                ]
+            elif kind == "tool_group":
+                calls_to_run = list(payload.calls)
+
+            if calls_to_run is not None:
+                try:
+                    ready_calls = executable_tool_calls(calls_to_run)
+                except (IncompleteToolCallError, DuplicateCallIdError) as exc:
+                    notice = SkillForge.retry_notice(str(exc))
+                    self.record({"role": "assistant", "content": notice, "created_at": now()})
+                    self.run_store.write_task_state(task_state)
+                    continue
+                executed_results = []
+                group_id = new_group_id(getattr(model_response, "response_id", "") or "")
+                expected_call_ids = [call.call_id for call in ready_calls]
                 self.record(
                     {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
+                        "role": "assistant",
+                        "content": str(getattr(model_response, "text", "") or ""),
+                        "tool_calls": [
+                            {
+                                "call_id": call.call_id,
+                                "name": call.name,
+                                "arguments": dict(call.arguments),
+                            }
+                            for call in ready_calls
+                        ],
+                        "group_id": group_id,
+                        "group_expected_call_ids": expected_call_ids,
                         "created_at": now(),
                     }
                 )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
-                        "name": name,
-                        "args": args,
-                        "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(self._last_tool_result_metadata or {}),
-                    },
-                )
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
+                for call in ready_calls:
+                    tool_steps += 1
+                    name = call.name
+                    args = dict(call.arguments)
+                    task_state.record_tool(name)
+                    if self.workflow and self.workflow_kernel:
+                        self.workflow_kernel.record_tool()
+                    tool_started_at = time.monotonic()
+                    result = self.run_tool(name, args, call_id=call.call_id)
+                    executed_results.append({"call_id": call.call_id, "output": result, "name": name})
+                    if self._last_native_tools_sent:
+                        pending = {
+                            "call_id": call.call_id,
+                            "output": result,
+                            "name": name,
+                        }
+                        if isinstance(args, str):
+                            pending["arguments"] = args
+                        else:
+                            pending["arguments"] = dict(args or {})
+                        self._pending_native_tool_results.append(pending)
+                    self._record_tool_evidence(name, args, result)
+                    self.record(
+                        {
+                            "role": "tool",
+                            "name": name,
+                            "args": args,
+                            "call_id": call.call_id,
+                            "group_id": group_id,
+                            "group_expected_call_ids": expected_call_ids,
+                            "content": result,
+                            "created_at": now(),
+                        }
+                    )
+                    self.run_store.write_task_state(task_state)
+                    self.emit_trace(
+                        task_state,
+                        "tool_executed",
+                        {
+                            "name": name,
+                            "args": args,
+                            "call_id": call.call_id,
+                            "result": clip(result, 500),
+                            "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                            **dict(self._last_tool_result_metadata or {}),
+                        },
+                    )
+                    checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
+                    self.run_store.write_task_state(task_state)
+                    self.emit_trace(
+                        task_state,
+                        "checkpoint_created",
+                        {
+                            "checkpoint_id": checkpoint["checkpoint_id"],
+                            "trigger": "tool_executed",
+                        },
+                    )
+                ToolCallGroup(response_id=model_response.response_id, calls=ready_calls).associate_results(
+                    executed_results
                 )
                 continue
 
@@ -1610,7 +1991,7 @@ class SkillForge:
                 self.run_store.write_task_state(task_state)
                 continue
 
-            final = (payload or raw).strip()
+            final = str(payload or model_response.text or "").strip()
             if (
                 self.workflow
                 and self.workflow_kernel
@@ -1630,7 +2011,11 @@ class SkillForge:
                 and self.workflow_kernel.state.phase == "handoff"
             ):
                 self._record_handoff_evidence(final)
-                gate_result = CompletionGate(self.workflow).evaluate(self.current_evidence_store().records())
+                gate_result = CompletionGate(self.workflow).evaluate(
+                    self.current_evidence_store().records(),
+                    task_contract=self.task_contract,
+                    current_manifest=self.capture_workspace_snapshot(),
+                )
                 if not gate_result.allowed:
                     self.record({"role": "assistant", "content": final, "created_at": now()})
                     return self._completion_gate_failure(task_state, user_message, gate_result)
@@ -1716,105 +2101,235 @@ class SkillForge:
         self.run_store.write_report(task_state, self.redact_artifact(self.build_report(task_state)))
         return final
 
-    def run_tool(self, name, args):
+    def _gateway_metadata(self, tool, **overrides):
+        meta = {
+            "tool_status": "rejected",
+            "tool_error_code": "",
+            "security_event_type": "",
+            "risk_level": "high" if (tool or {}).get("risky") else "low",
+            "read_only": not (tool or {}).get("risky", False),
+            "affected_paths": [],
+            "workspace_changed": False,
+            "diff_summary": [],
+            "contract_revision": getattr(self.task_contract, "revision", None),
+            "authorization_intact": True,
+        }
+        meta.update(overrides)
+        return meta
+
+    def _tool_rel_path(self, name, args):
+        if name not in {"list_files", "read_file", "search", "write_file", "patch_file"}:
+            return None
+        raw = (args or {}).get("path", ".")
+        resolved = self.path(raw)
+        root_resolved = Path(self.root).resolve()
+        try:
+            return resolved.relative_to(root_resolved).as_posix()
+        except ValueError:
+            return resolved.relative_to(self.root).as_posix()
+
+    def _lookup_completed_call(self, call_id, args):
+        if not call_id:
+            return None
+        store = self._persistence_store()
+        if store is None:
+            return None
+        existing = store.get_tool_call(call_id)
+        if existing is None:
+            return None
+        from .store import canonical_hash
+
+        if existing["args_hash"] != canonical_hash(args):
+            raise ToolCallConflict(f"call_id {call_id!r} already stored with different args")
+        return existing
+
+    def _record_completed_call(self, call_id, name, args, result):
+        if not call_id:
+            return None
+        store = self._persistence_store()
+        if store is None:
+            return None
+        run_id = getattr(self.current_task_state, "run_id", None)
+        return store.remember_tool_call(
+            call_id,
+            dict(args),
+            name=name,
+            run_id=run_id,
+            result=result,
+            state="completed",
+        )
+
+    def apply_patch_plan(self, plan, *, ticket=None):
+        """应用多文件 PatchPlan。部分失败可定位，不声称原子提交。"""
+        if not isinstance(plan, PatchPlan):
+            plan = PatchPlan.from_dict(plan)
+        for hunk in plan.hunks:
+            rel = self._tool_rel_path("patch_file" if hunk.op != "write" else "write_file", {"path": hunk.path})
+            decision = self.authz.decide(
+                "write_file" if hunk.op == "write" else "patch_file",
+                {"path": hunk.path},
+                rel_path=rel,
+                ticket=ticket,
+            )
+            if decision.action != DECISION_ALLOW:
+                plan.status = "NEEDS_REVIEW"
+                hunk.status = "FAILED"
+                hunk.error = decision.reason
+                self.patch_plans[plan.plan_id] = plan
+                return plan
+        applied = apply_plan(self, plan)
+        self.patch_plans[applied.plan_id] = applied
+        self._last_tool_result_metadata = self._gateway_metadata(
+            {"risky": True},
+            tool_status="ok" if applied.status == "APPLIED" else "partial_success",
+            tool_error_code="" if applied.status == "APPLIED" else "patch_plan_needs_review",
+            authorization_intact=True,
+            patch_plan=applied.locatable_status(),
+        )
+        return applied
+
+    def run_tool(self, name, args, *, call_id=None, attempt_id=None, approval_ticket=None):
         """执行一次工具调用，并在执行前后套上完整护栏。
 
-        为什么存在：
-        在 agent 系统里，真正危险的不是“模型会不会想调用工具”，而是
-        “平台有没有在执行前把边界守住”。这个函数就是工具层的总闸口：
-        所有工具调用都必须先经过它，不能让模型直接碰到底层函数。
-
-        输入 / 输出：
-        - 输入：工具名 `name`，参数字典 `args`
-        - 输出：字符串结果。无论是成功结果还是错误信息，都会统一返回文本，
-          这样模型下一轮都能继续消费这份反馈。
-
-        在 agent 链路里的位置：
-        它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
-        意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
-        工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
-        是否需要回写记忆。
+        网关顺序：结构校验 → 规范化 → 会话与阶段授权 → 配额 → 调用身份
+        → 审批 → 执行前再核哈希 → 执行与记录。
+        call_id 是逻辑动作；attempt_id 只标识某次尝试，不用来移用授权。
         """
-        # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
-        # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
-        # -> 真正执行 -> 更新记忆。
+        del attempt_id
         tool = self.tools.get(name)
         if tool is None:
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "unknown_tool",
-                "security_event_type": "",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
+            self._last_tool_result_metadata = self._gateway_metadata(
+                None, tool_error_code="unknown_tool", risk_level="high", read_only=False
+            )
             return f"error: unknown tool '{name}'"
         if self.workflow and self.workflow_kernel:
             packet = self.active_task_packet or self._compile_workflow_task_packet(
                 self.current_task_state.user_request if self.current_task_state else self.memory.to_dict()["working"].get("task_summary", "") or "workflow task"
             )
             allowed_tools = self.current_allowed_tool_names() if packet is not None else ()
-            if packet is not None and name not in allowed_tools:
-                self._last_tool_result_metadata = {
-                    "tool_status": "rejected",
-                    "tool_error_code": "workflow_tool_not_allowed",
-                    "security_event_type": "workflow_tool_not_allowed",
-                    "risk_level": "high" if tool["risky"] else "low",
-                    "read_only": not tool["risky"],
-                    "affected_paths": [],
-                    "workspace_changed": False,
-                    "diff_summary": [],
-                }
+            phase_ok = packet is None or name in allowed_tools or name in AUTHORIZED_ARTIFACT_READ_TOOLS
+            if not phase_ok:
+                self._last_tool_result_metadata = self._gateway_metadata(
+                    tool,
+                    tool_error_code="workflow_tool_not_allowed",
+                    security_event_type="workflow_tool_not_allowed",
+                )
                 return f"error: tool {name} is not allowed in workflow {packet.workflow} phase {packet.phase}"
         try:
-            self.validate_tool(name, args)
+            # 1. 结构校验  2. 规范化
+            identity_args = toolkit.normalize_tool_args(name, args)
+            self.validate_tool(name, identity_args)
+            rel_path = self._tool_rel_path(name, identity_args)
+        except StaleInputError as exc:
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool, tool_error_code="stale_input", authorization_intact=True
+            )
+            return f"error: STALE_INPUT: {exc}"
         except Exception as exc:
             example = self.tool_example(name)
             message = f"error: invalid arguments for {name}: {exc}"
             if example:
                 message += f"\nexample: {example}"
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "invalid_arguments",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_error_code="invalid_arguments",
+                security_event_type=security_event_type,
+            )
             return message
-        if self.repeated_tool_call(name, args):
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "repeated_identical_call",
-                "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
-            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
-        if tool["risky"] and not self.approve(name, args):
-            self._last_tool_result_metadata = {
-                "tool_status": "rejected",
-                "tool_error_code": "approval_denied",
-                "security_event_type": "read_only_block" if self.read_only else "approval_denied",
-                "risk_level": "high",
-                "read_only": False,
-                "affected_paths": [],
-                "workspace_changed": False,
-                "diff_summary": [],
-            }
+        # 3. 会话与阶段授权（workflow 已在上面；此处是 TaskContract 范围）
+        ticket = approval_ticket
+        if isinstance(ticket, str):
+            ticket = self.authz.load_ticket(ticket)
+        decision = self.authz.decide(name, identity_args, rel_path=rel_path, ticket=ticket)
+        if decision.action == DECISION_DENY:
+            code = "approval_denied"
+            security = "approval_denied"
+            if decision.reason == "read_only":
+                security = "read_only_block"
+            elif decision.reason == "out_of_scope":
+                code = "out_of_scope"
+                security = "out_of_scope"
+            elif decision.reason == "ticket_mismatch":
+                code = "ticket_mismatch"
+                security = "ticket_mismatch"
+            elif decision.reason == "capability_not_granted":
+                code = "capability_not_granted"
+                security = "capability_not_granted"
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_error_code=code,
+                security_event_type=security,
+                authorization_intact=True,
+            )
+            if decision.reason == "ticket_mismatch":
+                return f"error: approval ticket mismatch for {name}: ticket is bound to another spec"
+            if decision.reason == "out_of_scope":
+                return f"error: out of task scope for {name}"
+            if decision.reason == "capability_not_granted":
+                return f"error: capability not granted for {name}"
             return f"error: approval denied for {name}"
+        if decision.action == DECISION_NEED_TICKET:
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool, tool_error_code="precise_ticket_required", security_event_type="precise_ticket_required"
+            )
+            return f"error: precise approval required for {name}"
+        # 4. 配额
+        encoded = json.dumps(identity_args, ensure_ascii=True)
+        if len(encoded) > 1_000_000:
+            self._last_tool_result_metadata = self._gateway_metadata(tool, tool_error_code="quota_exceeded")
+            return f"error: arguments exceed quota for {name}"
+        # 5. 调用身份（call_id ≠ attempt）
+        try:
+            existing = self._lookup_completed_call(call_id, identity_args)
+        except ToolCallConflict as exc:
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool, tool_error_code="call_id_conflict", security_event_type="call_id_conflict"
+            )
+            return f"error: call_id conflict: {exc}"
+        if existing is not None and existing.get("state") == "completed":
+            stored = existing.get("result")
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_status="ok",
+                tool_error_code="",
+                replayed_call_id=call_id,
+            )
+            return stored if stored is not None else ""
+        # 循环检测仍保留，但已完成的同 ID 回放优先于它。
+        if self.repeated_tool_call(name, identity_args):
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool, tool_error_code="repeated_identical_call"
+            )
+            return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+        # 6. 审批（范围授权已在 decide 放行；ask 仅用于未覆盖的 process）
+        if decision.action == DECISION_ASK and not self.approve(name, identity_args, decision=decision):
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_error_code="approval_denied",
+                security_event_type="approval_denied",
+            )
+            return f"error: approval denied for {name}"
+        if tool["risky"] and decision.action not in {DECISION_ALLOW, DECISION_ASK}:
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool, tool_error_code="approval_denied", security_event_type="approval_denied"
+            )
+            return f"error: approval denied for {name}"
+        exec_args = dict(identity_args)
+        if name in {"write_file", "patch_file"} and not str(exec_args.get("expected_content_hash") or "").strip():
+            exec_args["expected_content_hash"] = file_content_hash(self.path(exec_args["path"]))
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
-            result = clip(tool["run"](args))
+            # 7. 执行前再核哈希发生在 write/patch 内部；此处不持有 DB 事务。
+            result = tool["run"](exec_args)
+            result = toolresult.ensure_history_envelope(
+                result,
+                store=self.artifact_store(),
+                run_id=toolresult.agent_run_id(self),
+                tool_name=name,
+            )
+            self._record_completed_call(call_id, name, identity_args, result)
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
@@ -1829,36 +2344,51 @@ class SkillForge:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
-            self.update_memory_after_tool(name, args, result)
-            self._last_tool_result_metadata = {
-                "tool_status": tool_status,
-                "tool_error_code": tool_error_code,
-                "security_event_type": "",
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-            }
+            self.update_memory_after_tool(name, identity_args, result)
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_status=tool_status,
+                tool_error_code=tool_error_code,
+                risk_level="high" if tool["risky"] else "low",
+                read_only=not tool["risky"],
+                affected_paths=affected_paths,
+                workspace_changed=workspace_changed,
+                workspace_fingerprint=self.workspace.fingerprint(),
+                diff_summary=diff_summary,
+                authorization_intact=True,
+            )
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
+        except StaleInputError as exc:
+            after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
+            affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_status="error",
+                tool_error_code="stale_input",
+                affected_paths=affected_paths,
+                workspace_changed=bool(affected_paths),
+                diff_summary=diff_summary,
+                authorization_intact=True,
+            )
+            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
+            return f"error: STALE_INPUT: {exc}"
         except Exception as exc:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
             affected_paths, diff_summary = self.diff_workspace_snapshots(before_snapshot, after_snapshot)
             workspace_changed = bool(affected_paths)
             security_event_type = "path_escape" if "path escapes workspace" in str(exc) else ""
-            self._last_tool_result_metadata = {
-                "tool_status": "partial_success" if workspace_changed else "error",
-                "tool_error_code": "tool_partial_success" if workspace_changed else "tool_failed",
-                "security_event_type": security_event_type,
-                "risk_level": "high" if tool["risky"] else "low",
-                "read_only": not tool["risky"],
-                "affected_paths": affected_paths,
-                "workspace_changed": workspace_changed,
-                "workspace_fingerprint": self.workspace.fingerprint(),
-                "diff_summary": diff_summary,
-            }
+            self._last_tool_result_metadata = self._gateway_metadata(
+                tool,
+                tool_status="partial_success" if workspace_changed else "error",
+                tool_error_code="tool_partial_success" if workspace_changed else "tool_failed",
+                security_event_type=security_event_type,
+                affected_paths=affected_paths,
+                workspace_changed=workspace_changed,
+                workspace_fingerprint=self.workspace.fingerprint(),
+                diff_summary=diff_summary,
+                authorization_intact=True,
+            )
             self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return f"error: tool {name} failed: {exc}"
 
@@ -1931,8 +2461,12 @@ class SkillForge:
     def tool_delegate(self, args):
         return toolkit.tool_delegate(self, args)
 
-    def approve(self, name, args):
+    def approve(self, name, args, decision=None):
         if self.read_only:
+            return False
+        if decision is not None and decision.action == DECISION_ALLOW:
+            return True
+        if decision is not None and decision.action == DECISION_DENY:
             return False
         if self.approval_policy == "auto":
             return True
@@ -1943,6 +2477,35 @@ class SkillForge:
         except EOFError:
             return False
         return answer.strip().lower() in {"y", "yes"}
+
+    def interpret_model_response(self, model_response):
+        """把不可变 ModelResponse 变成 runtime 动作。XML 只在显式兼容路径解析。"""
+        if not isinstance(model_response, ModelResponse):
+            model_response = ModelResponse(
+                response_id="",
+                text_blocks=(str(model_response),) if model_response else (),
+            )
+        if self._last_native_tools_sent:
+            if model_response.tool_calls:
+                try:
+                    return "tool_group", ToolCallGroup(
+                        response_id=model_response.response_id,
+                        calls=model_response.tool_calls,
+                    )
+                except DuplicateCallIdError as exc:
+                    return "retry", SkillForge.retry_notice(str(exc))
+            text = model_response.text.strip()
+            if text:
+                return "final", text
+            if model_response.finish_reason == "incomplete":
+                return "retry", SkillForge.retry_notice("streaming tool arguments were incomplete")
+            return "retry", SkillForge.retry_notice("model returned an empty response")
+        if self.xml_tool_compat_enabled():
+            return self.parse(model_response.text)
+        text = model_response.text.strip()
+        if text:
+            return "final", text
+        return "retry", SkillForge.retry_notice("model returned an empty response")
 
     @staticmethod
     def parse(raw):
@@ -2075,9 +2638,15 @@ class SkillForge:
         path = Path(raw_path)
         path = path if path.is_absolute() else self.root / path
         resolved = path.resolve()
+        root_resolved = Path(self.root).resolve()
         # 所有文件类工具都被锚定在 workspace root 之下。
         # 这样既能防住 "../" 逃逸，也能防住符号链接解析后跳出仓库。
-        if os.path.commonpath([str(self.root), str(resolved)]) != str(self.root):
+        # Windows 不同盘符 / UNC 会让 commonpath 抛 ValueError，一律视为越界。
+        try:
+            common = os.path.commonpath([str(root_resolved), str(resolved)])
+        except ValueError as exc:
+            raise ValueError(f"path escapes workspace: {raw_path}") from exc
+        if os.path.normcase(common) != os.path.normcase(str(root_resolved)):
             raise ValueError(f"path escapes workspace: {raw_path}")
         return resolved
 

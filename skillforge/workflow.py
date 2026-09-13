@@ -4,6 +4,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 import tempfile
 
+from .verification import (
+    RESULT_PASS,
+    evaluate_verification_payload,
+)
+
 
 WORKFLOW_IR_SCHEMA_VERSION = "workflow-ir-v1"
 WORKFLOW_IR_ARTIFACT_TYPE = "workflow_ir"
@@ -978,19 +983,33 @@ class CompletionGate:
     def __init__(self, workflow):
         self.workflow = workflow
 
-    def evaluate(self, records):
+    def evaluate(self, records, task_contract=None, current_manifest=None):
+        records = tuple(records)
         by_type = {record.record_type: record for record in records}
         missing = []
         invalid = []
+        contract_view = task_contract.b05_view() if task_contract is not None else None
         for requirement in self.workflow.completion_requirements:
             record = by_type.get(requirement)
             if record is None:
                 missing.append(requirement)
                 continue
             if requirement == "verification":
-                status = str(record.payload.get("status", "")).strip()
-                if status not in {"passed", "pass"}:
-                    invalid.append(f"verification evidence status={status or 'missing'}")
+                if contract_view is None:
+                    status = str(record.payload.get("status", "")).strip()
+                    if status not in {"passed", "pass"}:
+                        invalid.append(f"verification evidence status={status or 'missing'}")
+                else:
+                    result, reasons = evaluate_verification_payload(
+                        record.payload,
+                        contract_view,
+                        current_manifest=current_manifest,
+                        records=records,
+                        verification_record=record,
+                    )
+                    if result != RESULT_PASS:
+                        detail = "; ".join(reasons) if reasons else result
+                        invalid.append(f"verification evidence result={result}: {detail}")
             if requirement == "audit":
                 status = str(record.payload.get("status", "")).strip()
                 if status not in AUDIT_ACCEPTED_STATUSES:
@@ -1006,8 +1025,8 @@ class CompletionGate:
             evidence_refs=tuple(record.evidence_id for record in records),
         )
 
-    def can_complete(self, records):
-        return self.evaluate(records).allowed
+    def can_complete(self, records, task_contract=None, current_manifest=None):
+        return self.evaluate(records, task_contract=task_contract, current_manifest=current_manifest).allowed
 
 
 @dataclass(frozen=True)

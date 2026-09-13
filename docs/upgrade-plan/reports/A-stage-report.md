@@ -1,6 +1,8 @@
 # 阶段报告：A 基线固定
 
-> 本文件供用户与任务分发 Agent 讨论是否关闭 A。不打开业务代码或原始日志也应能读懂。旧弱点已记录，不等于已修复。本主控不宣布阶段 CLOSED，不改总进度，不建立 Git 提交，不启动 B。
+> 本文件供用户与任务分发 Agent 讨论是否关闭 A。不打开业务代码或原始日志也应能读懂。旧弱点已记录，不等于已修复。本主控不宣布阶段 CLOSED，不改总进度，不启动 B。
+>
+> 第 1–7 节是 2026-09-13 原报告，保留不改写。第 8 节是同日用户批准 A-06 后的收尾补充：可恢复基线现以本地 Git 提交为准；D2/D3 已由用户决定落地。后续把 SHA 写入本文件会产生提交后未提交文档差异，属预期，不再循环提交。
 
 ## 1. 结论与范围
 
@@ -28,7 +30,8 @@
 | A-02 | DONE | [A-02 运行路径](58cc5756-4cda-479c-b0be-8897e8fcc185) | 前台 CLI 已跑通；无 FastAPI；OpenAI `/v1/responses` 在线 1 次 | [A-02-runtime-paths.md](A/A-02-runtime-paths.md) | 无 DONE 阻塞 |
 | A-03 | DONE | [A-03 模块现状](36764dab-4273-4c83-a36a-e8633d029c41) | 第 00 章主判断仍成立；XML 为唯一协议；无 SQLite | [A-03-module-status.md](A/A-03-module-status.md) | 运行面交 A-02/A-04 |
 | A-04 | DONE | [A-04 基线输入](a0dece7e-8e58-42f9-b7b1-6067b1589b6c) | 离线子集与 fake CLI 配方；在线题只留配方 | [A-04-baseline-inputs.md](A/A-04-baseline-inputs.md) | 在线题费用控制未跑 |
-| A-05 | DONE | 本会话 A 阶段主控 | 本阶段报告 | 本文件 | 待用户关闭，不是任务未完成 |
+| A-05 | DONE | 本会话 A 阶段主控 | 本阶段原报告 | 本文件第 1–7 节 | 原提交时待用户关闭 |
+| A-06 | DONE | [A-06 Git 检查点](a31da975-53a7-43a1-8f61-c6f49103f3fb) | 本地基线提交；可恢复性核对通过 | [A-06-git-checkpoint.md](A/A-06-git-checkpoint.md) | 无 |
 
 ## 3. 验收结果
 
@@ -157,4 +160,68 @@ B 不要实现：ProcessJob 完整协调、Skill 重构、多 Agent 并行、Fas
 - 本阶段仍在运行的子任务：**无**
 - 总进度 `03-progress.md` 仍应由任务分发 Agent 在用户明确关闭后更新；本主控未改该表。
 
-请用户决定是否关闭 A 阶段（建议关闭，见 D1）。关闭后由任务分发 Agent 更新总进度，并按 D2 提醒建立检查点。A 主控到此停止，不启动 B。
+请用户决定是否关闭 A 阶段（建议关闭，见 D1）。关闭后由任务分发 Agent 更新总进度。A 主控到此停止，不启动 B。
+
+---
+
+## 8. 基线收尾补充（2026-09-13）
+
+依据：用户投放 `docs/upgrade-plan/prompts/A-closeout.md`；U08/U09 已批准。执行：[A-06 Git 检查点](a31da975-53a7-43a1-8f61-c6f49103f3fb)。未重跑 A-01—05 验收，未启动 B。
+
+### 8.1 对原结论所依据事实的修正
+
+原第 1 节写「不是 git 仓库，无 HEAD SHA；原版 = 当前整棵工作区」。这在 A-05 提交时成立，**现已过时**。
+
+原第 4.5 节用「路径 + 三个文件哈希」代替不可变指针，只能定位当时工作区，**不能**在文件被覆盖后取回。A-06 之前也没有覆盖 A 已测范围的独立副本：根目录升级 ZIP 不是工作区快照；旁系 `D:\Project\skill-forge`（HEAD `6813551`，有 GitHub remote）工作区脏且无 `docs/upgrade-plan/`，不能冒充本树快照。
+
+**现在可恢复原版的依据是本树本地 Git 提交，而不是仅有工作区路径和三个哈希。**
+
+| 项 | 值 |
+|---|---|
+| 仓库 | `D:\Project\SkillForge_0912`（无 remote，未推送） |
+| 分支 | `master` |
+| 完整 SHA | `f351988c1dda3bb62012580d4b3fa08fde9b8b8a` |
+| 短 SHA | `f351988` |
+| 与 A 已测版本 | 工作区三身份文件 SHA256 仍等于 A-01；`git archive` 导出后三哈希同样等于 A-01。系统 `core.autocrlf=true` 使裸 blob 为 LF；Windows 检出/归档回到 A-01 的 CRLF 字节。 |
+| 纳入 | `skillforge/`、`tests/`、`pyproject.toml`、`README.md`、`.env.example`、脚本/评测材料、`docs/upgrade-plan/`（含 A-01—A-04 与 baseline-inputs）、`SkillForge_Upgrade_Design.md`、本次最小 `.gitignore` 调整 |
+| 排除（仍在磁盘，未删） | `.env`/凭据；`.tmp_a02_*` / `.tmp_a04_*`；缓存；`.skillforge/`；`*.zip`；`pico_coding-agent-main/`；`docs/` 下非 upgrade-plan 的历史材料 |
+| 恢复额外条件 | 本地另备 `.env`；Python ≥3.10 与自行安装的 pytest 等开发依赖；提交内无 `.venv` / lockfile。无 `.env` 不能复现 A-02 在线路径 |
+
+### 8.2 首个 Git 提交与后续文档变更
+
+`f351988` 保存的是提交当时的源码、测试、已更新的增订/开发指南，以及 A-01—A-05 原报告。它**不包含**：本 A-06 子报告、本节收尾补充、任务表上 A-06 完成后的状态改写。
+
+这是预期状态：把 SHA 写入报告必然产生提交后未提交文档差异。不为把报告包进同一 SHA 而再提交。B 若获准启动，源码对照应以 `f351988` 为准；阅读最新交接说明应叠加工作区中未提交的第 8 节与 `A-06-git-checkpoint.md`。
+
+任务分发 Agent 已在用户关闭 A **之前**按 U08 更新了增订和开发指南；那些修正已进入 `f351988`。原升级方案未改。
+
+### 8.3 核对结果（未重跑功能验收）
+
+- 从提交 `git archive` 到仓库外临时目录，三身份文件哈希与 A-01 一致；随后删除导出。
+- 提交内有 `skillforge/cli.py`、`pyproject.toml`、`tests/`、`docs/upgrade-plan/reports/A/baseline-inputs/`、`01-addendum.md`。
+- 提交内无 `.env`、临时目录、缓存、`.skillforge/`、zip、pico 树。
+- 未 checkout/reset 覆盖工作区，未重跑 pytest，未再打付费 API。
+
+### 8.4 原 D1–D3 的现状
+
+| 原项 | 现状 |
+|---|---|
+| D1 是否关闭 A | **仍待用户确认。** 推荐关闭。A-06 已补上原报告缺的可恢复快照。 |
+| D2 如何建检查点 | **已完成。** 用户授权后由执行子 Agent 完成本地基线提交；无需再从零 init。不要 push。 |
+| D3 最小文档修正 | **已由任务分发 Agent 写入增订/开发指南**（U08），并包含在 `f351988` 中。 |
+
+### 8.5 交接增量（仍不启动 B）
+
+| 交接项 | 更新 |
+|---|---|
+| 原版定位 | **先** `f351988c1dda3bb62012580d4b3fa08fde9b8b8a`；再用 A-01 三哈希核对 Windows 工作区/归档。不要只用路径。不要用旁系 `skill-forge` 的 `6813551`。 |
+| Git | 仅本地；无 remote。后续实现提交应在此检查点之后另开，不改写本 SHA。 |
+| 其余合同 | 仍以第 6 节为准（入口、`/v1/responses`、XML 唯一、Session JSON、pytest 完成门等） |
+
+### 8.6 关闭申请
+
+- 追踪表：`docs/upgrade-plan/phases/A-baseline.md`（A-01—A-06 均为 DONE）
+- 本阶段仍在运行的子任务：**无**
+- 阻塞：**无**
+- 建议：用户确认关闭 A。关闭后由任务分发 Agent 将总进度改为 CLOSED，并登记本 SHA；不必再提醒“尚未建检查点”。不要自行启动 B。
+

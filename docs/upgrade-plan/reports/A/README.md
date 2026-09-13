@@ -6,5 +6,6 @@
 - `A-02-runtime-paths.md`（附件 `A-02-openai-probe.txt`）
 - `A-03-module-status.md`
 - `A-04-baseline-inputs.md`（夹具 `baseline-inputs/`）
+- `A-06-git-checkpoint.md`
 
-阶段总报告：[`../A-stage-report.md`](../A-stage-report.md)
+阶段总报告：[`../A-stage-report.md`](../A-stage-report.md)（第 8 节为 2026-09-13 收尾补充）

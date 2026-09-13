@@ -1630,20 +1630,29 @@ def test_explicit_memory_promotion_dedupes_duplicate_durable_note(tmp_path):
 
 
 def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
+    from skillforge.prompt_manifest import UNKNOWN
+
     class CacheAwareFakeModelClient(FakeModelClient):
-        def complete(self, prompt, max_new_tokens, **kwargs):
-            self.last_completion_metadata = {
-                "prompt_cache_supported": True,
-                "cached_tokens": 512,
-                "cache_hit": True,
-                "input_tokens": 1024,
-            }
-            return super().complete(prompt, max_new_tokens, **kwargs)
+        def __init__(self, outputs):
+            super().__init__(outputs)
+            self.supports_prompt_cache = True
 
     workspace = build_workspace(tmp_path)
     store = SessionStore(tmp_path / ".skillforge" / "sessions")
     agent = MiniAgent(
-        model_client=CacheAwareFakeModelClient(["<final>Done.</final>"]),
+        model_client=CacheAwareFakeModelClient(
+            [
+                {
+                    "text": "<final>Done.</final>",
+                    "usage": {
+                        "input_tokens": 1024,
+                        "output_tokens": 4,
+                        "input_tokens_details": {"cached_tokens": 512},
+                        "cache_write": 0,
+                    },
+                }
+            ]
+        ),
         workspace=workspace,
         session_store=store,
         approval_policy="auto",
@@ -1651,11 +1660,24 @@ def test_agent_records_model_cache_metadata_in_last_prompt_metadata(tmp_path):
 
     assert agent.ask("Cache aware run") == "Done."
 
-    assert agent.last_prompt_metadata["prompt_cache_supported"] is True
-    assert agent.last_prompt_metadata["cached_tokens"] == 512
-    assert agent.last_prompt_metadata["cache_hit"] is True
-    assert agent.last_prompt_metadata["prefix_hash"]
-    assert agent.last_prompt_metadata["prompt_cache_key"] == agent.last_prompt_metadata["prefix_hash"]
+    meta = agent.last_prompt_metadata
+    assert meta["prompt_cache_supported"] is True
+    assert meta["prefix_hash"]
+    assert meta["prompt_cache_key"] == meta["prefix_hash"]
+    assert meta["model_response_usage"]["cache_read"] == 512
+    assert meta["model_response_usage"]["cache_write"] == 0
+    assert meta["usage_display"]["cache_read_tokens"] == 512
+    assert meta["usage_display"]["cache_write_tokens"] == 0
+    assert meta["usage_display"]["cache_hit"] is True
+    assert meta["prompt_manifest"]["actual_cache_read_tokens"] == 512
+    # 正式路径不绑 legacy cache_hit=false；改 last_completion_metadata 不影响 unknown/官方 usage。
+    agent.last_completion_metadata["cached_tokens"] = 0
+    agent.last_completion_metadata["cache_hit"] = False
+    agent.model_client.last_completion_metadata["cache_hit"] = False
+    agent.model_client.last_completion_metadata["cached_tokens"] = 0
+    assert agent.last_prompt_metadata["model_response_usage"]["cache_read"] == 512
+    assert agent.last_prompt_metadata["usage_display"]["cache_hit"] is True
+    assert agent.last_prompt_metadata["usage_display"]["cache_read_tokens"] != UNKNOWN
 
 
 def test_recent_transcript_entries_stay_richer_than_older_ones(tmp_path):
